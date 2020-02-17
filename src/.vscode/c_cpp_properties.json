@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "browse": {
+                "databaseFilename": "",
+                "limitSymbolsToIncludedHeaders": true
+            },
+            "includePath": [
+                "/home/ee904/work/devel/include/**",
+                "/opt/ros/kinetic/include/**",
+                "/home/ee904/work/src/argo/include/**",
+                "/home/ee904/work/src/ground_truth/include/**",
+                "/home/ee904/work/src/lidar_track/include/**",
+                "/usr/include/**"
+            ],
+            "name": "ROS",
+            "intelliSenseMode": "gcc-x64",
+            "compilerPath": "/usr/bin/gcc",
+            "cStandard": "c11",
+            "cppStandard": "c++17"
+        }
+    ],
+    "version": 4
+}
