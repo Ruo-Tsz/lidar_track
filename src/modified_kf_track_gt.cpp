@@ -159,11 +159,12 @@ float sigmaQ=0.1;//0.1
 int id_count = 0; //the counter to calculate the current occupied track_id
 
 ////////////////////////kalman/////////////////////////
-#define cluster_num 40 
 #define frame_lost 5
 #define detect_thres 2.5 //l=4.5,w=1.8 (4.7,1.86 for nu)
 #define bias 3.0 //5
-#define moving 0.1 //(10hz(0.1s) v>1m/s => 60m/min=3.6km/hr = pedestrian)
+#define moving 1 //(10hz(0.1s) v>1m/s=60m/min=3.6km/hr = pedestrian)
+#define invalid_v 30 // 108km/hr
+#define show_tra 6
 
 bool get_label = false;
 
@@ -176,14 +177,13 @@ std::vector <float> kf_pre_cens;
 
 ros::Publisher objID_pub;
 // KF init
-int stateDim=6;// [x,y,v_x,v_y]//,w,h]
-int measDim=3;// [z_x,z_y//,z_w,z_h]
+int stateDim=6;// [x,y,z,v_x,v_y,v_z]  + w.h.l.theta
+int measDim=3;// [x,y,z]
 int ctrlDim=0;// control input 0(acceleration=0,constant v model)
 std::vector<pcl::PointCloud<PointT>::Ptr> cluster_vec;
 
 std::vector<cv::KalmanFilter> KF;//(stateDim,measDim,ctrlDim,CV_32F);
 
-//std::vector<geometry_msgs::Point> prevClusterCenters;
 cv::Mat state(stateDim,1,CV_32F);
 cv::Mat_<float> measurement(3,1);//x.y.z pose as measurement
 
@@ -198,7 +198,6 @@ typedef struct track{
   int lose_frame;
   int track_frame;
   string state;
-  int match_clus = 1000;
   int cluster_idx;
   int uuid ;
   vector<geometry_msgs::Point> history;
@@ -275,9 +274,9 @@ int new_track(PointT cen, int idx){
     ka.errorCovPost = (Mat_<float>(6, 6) << 1,0,0,0,0,0,
                                             0,1,0,0,0,0,
                                             0,0,1,0,0,0,
-                                            0,0,0,1000.0,0,0,
-                                            0,0,0,0,1000.0,0,
-                                            0,0,0,0,0,1000.0);
+                                            0,0,0,10.0,0,0,
+                                            0,0,0,0,10.0,0,
+                                            0,0,0,0,0,10.0);
 
 
     
@@ -534,7 +533,7 @@ void show_id(vector<int>obj_id){
       marker.scale.z = 1.2f;
       // marker.color.b = 1.0f;
       // marker.color.g = 1.0f;
-      // marker.color.r = 1.0f;
+      // marker.color.r = 0;
       marker.color.b = 0.0f;//yellow
       marker.color.g = 0.9f;
       marker.color.r = 0.9f;
@@ -582,7 +581,7 @@ void show_trajectory(){
 
     // if (velocity >= moving && !(filters.at(k).state.compare("tracking"))){
     // if (velocity >= moving && velocity <= 5 && !(filters.at(k).state.compare("tracking"))){  
-    if (velocity >= moving && !(filters.at(k).state.compare("tracking"))){  
+    if (velocity >= moving && velocity < invalid_v && !(filters.at(k).state.compare("tracking"))){  
       visualization_msgs::Marker marker, P;
       marker.header.frame_id = FRAME;  
       marker.header.stamp = ros::Time();//to show every tag  (ros::Time::now()for latest tag)
@@ -610,10 +609,20 @@ void show_trajectory(){
       P.color.r = 1.0f;
       P.color.a = 1;
 
-      for (int i=0; i<filters.at(k).history.size(); i++){
-        geometry_msgs::Point pt = filters.at(k).history.at(i);
-        marker.points.push_back(pt);
-        P.points.push_back(pt);
+
+      if (filters.at(k).history.size() < show_tra){
+        for (int i=0; i<filters.at(k).history.size(); i++){
+            geometry_msgs::Point pt = filters.at(k).history.at(i);
+            marker.points.push_back(pt);
+            P.points.push_back(pt);
+        }
+      }
+      else{
+        for (vector<geometry_msgs::Point>::const_reverse_iterator r_iter = filters.at(k).history.rbegin(); r_iter != filters.at(k).history.rbegin()+ show_tra; ++r_iter){
+            geometry_msgs::Point pt = *r_iter;
+            marker.points.push_back(pt);
+            P.points.push_back(pt);
+        }
       }
     
       tra_array.markers.push_back(marker);
@@ -622,43 +631,7 @@ void show_trajectory(){
   }
 
   cout<<"We have "<<tra_array.markers.size()<< " moving objects."<<endl;
-  // for(vector<track>::const_iterator it = filters.begin( ); it != filters.end() ; it++){
-  //   marker.header.frame_id = FRAME;  
-  //   marker.header.stamp = ros::Time();//to show every tag  (ros::Time::now()for latest tag)
-  //   marker.action = visualization_msgs::Marker::ADD;
-  //   marker.pose.orientation.w = 1.0;
-  //   marker.lifetime = ros::Duration(2);
-  //   marker.id = k;
-  //   marker.type = visualization_msgs::Marker::LINE_STRIP;
 
-  //   marker.scale.x = 0.05f;
-  //   // marker.color.b = 1.0f;
-  //   marker.color.g = 1.0f;
-  //   // marker.color.r = 1.0f;
-  //   marker.color.a = 1;
-
-  //   for (int i=0; i<(*it).history.size(); i++){
-  //     geometry_msgs::Point pt = (*it).history.at(i);
-  //     marker.points.push_back(pt);
-  //   }
-   
-  //   tra_array.markers.push_back(marker);
-  //   k++;
-  // }
-
-  // if (tra_array.markers.size() > t_max_size)
-  //   t_max_size = tra_array.markers.size();
-
-  // for (int a = k; a < t_max_size; a++)
-  // {
-  //     marker.id = a;
-  //     marker.color.a = 0;
-  //     marker.pose.position.x = 0;
-  //     marker.pose.position.y = 0;
-  //     marker.pose.position.z = 0;
-  //     marker.scale.x = 0;
-  //     tra_array.markers.push_back(marker);
-  // }
   pub_tra.publish(tra_array);
   pub_pt.publish(point_array);
 }
@@ -675,13 +648,14 @@ void show_velocity(){
     pred.z = filters.at(k).pred_v.z;
     float velocity = sqrt(pred.x*pred.x + pred.y*pred.y + pred.z*pred.z);
 
-    if ( velocity >= moving && !(filters.at(k).state.compare("tracking")) ){
+    if ( velocity >= moving && velocity < invalid_v && !(filters.at(k).state.compare("tracking")) ){
       visualization_msgs::Marker arrow;
       arrow.header.frame_id = FRAME;
       arrow.header.stamp = ros::Time();
-      arrow.lifetime = ros::Duration();
+      arrow.lifetime = ros::Duration(3);
       arrow.action = visualization_msgs::Marker::ADD;
       arrow.type = visualization_msgs::Marker::ARROW;
+      arrow.id = k;
       
       geometry_msgs::Point tail, head;
       tail = filters.at(k).history.back();
@@ -689,17 +663,22 @@ void show_velocity(){
       head.y = tail.y  + filters.at(k).pred_v.y;
       head.z = tail.z  + filters.at(k).pred_v.z;
 
-      cout << tail.x << "," << tail.y << endl;
-      cout << head.x << "," << head.y << endl;
+      // cout << tail.x << "," << tail.y << endl;
+      // cout << head.x << "," << head.y << endl;
 
-      arrow.points.at(0) = tail;
-      arrow.points.at(1) = head;
+      // arrow.points.at(0) = tail;
+      // arrow.points.at(1) = head;
 
-      cout << arrow.points.at(0).x << endl;
-      cout << arrow.points.at(1).x << endl;
- 
-      arrow.scale.x = 0.1f;
-      arrow.scale.y = 0.2f;
+      arrow.points.push_back(tail);
+      arrow.points.push_back(head);
+
+
+      // cout << arrow.points.at(0).x << endl;
+      // cout << arrow.points.at(1).x << endl;
+      arrow.color.a = 1.0f;
+      arrow.color.b = 0.7f;
+      arrow.scale.x = 0.2f;
+      arrow.scale.y = 0.4f;
 
       v_array.markers.push_back(arrow);
     }
@@ -738,13 +717,13 @@ void KFT(ros::Time lidar_timestamp)
     std::vector<geometry_msgs::Point> clusterCenters;//clusterCenters
    
     int i=0;
-    cout << "Now cen is:"<<endl;
+    // cout << "Now cen is:"<<endl;
     for(i; i<cens.size(); i++){
       geometry_msgs::Point pt;
       pt.x=cens[i].x;
       pt.y=cens[i].y;
       pt.z=cens[i].z;
-      cout <<"("<<pt.x<<","<<pt.y<<","<<pt.z<<")"<<endl;
+      // cout <<"("<<pt.x<<","<<pt.y<<","<<pt.z<<")"<<endl;
       clusterCenters.push_back(pt);
     }
 
@@ -954,7 +933,7 @@ void KFT(ros::Time lidar_timestamp)
       float velocity = sqrt(pred.x*pred.x + pred.y*pred.y + pred.z*pred.z);
 
       // if(velocity >= moving && velocity <= 5 && !(filters.at(j).state.compare("tracking")) ){
-      if(velocity >= moving && !(filters.at(j).state.compare("tracking")) ){
+      if(velocity >= moving && velocity <= invalid_v && !(filters.at(j).state.compare("tracking")) ){
         cout<<"The state of "<<filters.at(j).uuid<<" filters is \033[1;34m"<<filters.at(j).state<<"\033[0m,to cluster_idx "<< filters.at(j).cluster_idx <<" track: "<<filters.at(j).track_frame<<endl;
         cout <<"The tra of "<<filters.at(j).uuid<<" is:"<<endl;
         for (int i=0; i<filters.at(j).history.size(); i++){
@@ -1216,7 +1195,7 @@ void callback(const sensor_msgs::PointCloud2 &msg){
 
   ec.setClusterTolerance (0.45); //0.5->cars merged to one cluster
   ec.setMinClusterSize (40); //25 for clustering_1hz 6f bag 
-  ec.setMaxClusterSize (300); //300 for bag1
+  ec.setMaxClusterSize (400); //300 for train2,400 for train1(truck)
   ec.setSearchMethod (tree);
   ec.setInputCloud (cloud_filtered);
   ec.extract (cluster_indices);
@@ -1322,9 +1301,9 @@ void callback(const sensor_msgs::PointCloud2 &msg){
         ka.errorCovPost = (Mat_<float>(6, 6) << 1,0,0,0,0,0,
                                           0,1,0,0,0,0,
                                           0,0,1,0,0,0,
-                                          0,0,0,1000.0,0,0,
-                                          0,0,0,0,1000.0,0,
-                                          0,0,0,0,0,1000.0);
+                                          0,0,0,10.0,0,0,
+                                          0,0,0,0,10.0,0,
+                                          0,0,0,0,0,10.0);
 
         tk.kf = ka;
         tk.state = "tracking";
