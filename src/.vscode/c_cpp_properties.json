@@ -11,7 +11,8 @@
                 "/home/ee904/work/src/argo/include/**",
                 "/home/ee904/work/src/ground_truth/include/**",
                 "/home/ee904/work/src/lidar_track/include/**",
-                "/usr/include/**"
+                "/usr/include/**",
+                "/home/ee904/work/src/depth_clustering/src/**"
             ],
             "name": "ROS",
             "intelliSenseMode": "gcc-x64",

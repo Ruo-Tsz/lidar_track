@@ -142,6 +142,7 @@ include_directories(
  include
  src
  ${catkin_INCLUDE_DIRS}
+ ${PCL_INCLUDE_DIRS}
 )
 
 
@@ -179,6 +180,11 @@ add_executable(
 add_executable(
    gt_output
    src/gt_output.cpp
+)
+
+add_executable(
+   region_seg
+   src/region_growing_seg.cpp
 )
 
 
@@ -234,6 +240,12 @@ target_link_libraries(
 target_link_libraries(
    gt_output
    ${catkin_LIBRARIES}
+ )
+
+target_link_libraries(
+   region_seg
+   ${catkin_LIBRARIES}
+   ${PCL_LIBRARIES}
  )
 
 
