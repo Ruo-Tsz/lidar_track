@@ -1,0 +1,10 @@
+<launch>
+    <node pkg = "lidar_track"   type="kal_update"   name="kal_update"> <!-- output="screen">-->
+        <param name="dataset"           value="argo"/>
+        <param name="output"            value="false"/>
+        <param name="global_frmae"      value="true"/>
+        <param name="use_detection"     value="true"/>
+    </node>
+</launch>
+
+
