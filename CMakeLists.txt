@@ -100,7 +100,26 @@ add_executable(
    src/test_detection.cpp
 )
 
+add_executable(
+   kal_update
+   src/kf_track_update.cpp src/Hungarian.cpp
+ )
 
+add_executable(
+   image_read
+   src/image_read.cpp
+ )
+
+
+add_executable(
+   subscribe_compressed_img
+   src/subscribe_compressed_img.cpp
+ )
+
+add_executable(
+   img_diff
+   src/img_diff.cpp
+ )
 
 ## Add cmake target dependencies of the library
 ## as an example, code may need to be generated before libraries
@@ -167,6 +186,32 @@ target_link_libraries(
    ${catkin_LIBRARIES}
    ${PCL_LIBRARIES}
  )
+
+target_link_libraries(
+   kal_update
+   ${catkin_LIBRARIES}
+ )
+
+target_link_libraries(
+   image_read
+   ${catkin_LIBRARIES}
+ )
+
+target_link_libraries(
+   subscribe_compressed_img
+   ${catkin_LIBRARIES}
+   ${PCL_LIBRARIES}
+   ${OpenCV_LIBRARIES}
+ )
+
+target_link_libraries(
+   img_diff
+   ${catkin_LIBRARIES}
+   ${PCL_LIBRARIES}
+   ${OpenCV_LIBRARIES}
+ )
+
+
 
 
 add_dependencies(gt_output argo_track_msgs_gencpp track_array_msgs_gencpp ${catkin_EXPORTED_TARGETS})
