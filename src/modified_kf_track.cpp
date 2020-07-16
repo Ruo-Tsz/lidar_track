@@ -782,7 +782,7 @@ void KFT(void)
     k=0;
     visualization_msgs::Marker marker;
     for(k; k<cens.size(); k++){
-        marker.header.frame_id="/nuscenes_lidar";
+        marker.header.frame_id="/scan";
         marker.header.stamp = ros::Time();//to show every tag  (ros::Time::now()for latest tag)
         //marker.ns = "basic_shapes";
         marker.action = visualization_msgs::Marker::ADD;
@@ -1078,7 +1078,7 @@ void callback(const sensor_msgs::PointCloud2 &msg){
     int k;
     visualization_msgs::Marker marker;
     for(k=0; k<cens.size(); k++){
-      marker.header.frame_id="/nuscenes_lidar"; //child of pointcloud of tf map
+      marker.header.frame_id="/scan"; //child of pointcloud of tf map
       marker.header.stamp = ros::Time();//to show every tag  (ros::Time::now()for latest tag)
       //marker.ns = "basic_shapes";
       marker.action = visualization_msgs::Marker::ADD;
@@ -1122,7 +1122,7 @@ void callback(const sensor_msgs::PointCloud2 &msg){
     //cloud_clusters = crop(cloud_clusters);
     sensor_msgs::PointCloud2 cluster_cloud;
     pcl::toROSMsg(*cloud_clusters, cluster_cloud);
-    cluster_cloud.header.frame_id = "/nuscenes_lidar";
+    cluster_cloud.header.frame_id = "/scan";
     cluster_pub.publish(cluster_cloud);
 
           
@@ -1135,7 +1135,7 @@ void callback(const sensor_msgs::PointCloud2 &msg){
   cloud_clusters = crop(cloud_clusters);
   sensor_msgs::PointCloud2 cluster_cloud;
   pcl::toROSMsg(*cloud_clusters, cluster_cloud);
-  cluster_cloud.header.frame_id = "/nuscenes_lidar";
+  cluster_cloud.header.frame_id = "/scan";
   cluster_pub.publish(cluster_cloud);
   
   return;
@@ -1157,7 +1157,7 @@ int main(int argc, char** argv){
   ros::NodeHandle nh;
 
   // sub = nh.subscribe("points_raw",1000,&callback);
-  sub = nh.subscribe("nuscenes_lidar",1,&callback);
+  sub = nh.subscribe("scan",1,&callback);
   label_sub = nh.subscribe("lidar_label",1,&callback_label);
   
   pub_get = nh.advertise<sensor_msgs::PointCloud2>("original_pc", 1000);

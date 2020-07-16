@@ -42,6 +42,9 @@
 #include <visualization_msgs/MarkerArray.h>
 #include <visualization_msgs/Marker.h>
 
+#include <jsk_recognition_msgs/BoundingBoxArray.h>
+#include <jsk_recognition_msgs/BoundingBox.h>
+
 
 // #include "darknet_ros_msgs/BoundingBoxes.h"
 // #include "darknet_ros_msgs/BoundingBox.h"
@@ -136,16 +139,13 @@ string FRAME="/scan";  //output frmae_id
 typedef pcl::PointXYZI PointT;
 ros::Subscriber sub,label_sub;
 ros::Publisher pub,pub_get,pub_colored;
-ros::Publisher pub_voxel,pub_marker,pub_tra,pub_pt,pub_v,pub_pred, pub_self_v, pub_detection;
+ros::Publisher pub_voxel,pub_marker,pub_tra,pub_pt,pub_v,pub_pred, pub_self_v, pub_detection, pub_jsk_bbox;
 ros::Publisher cluster_pub;
 
 //get.pub image
 image_transport::Subscriber img_sub;
 image_transport::Publisher img_pub;
 
-
-tf::StampedTransform scan_transform;
-sensor_msgs::PointCloud2  output, now_scan;
 // tf::TransformListener listener;//declare in global would act like initialing a handler, it then before ros::init() and cause error 
 tf::TransformListener *tf_listener; //Use a pointer to initialize in main instead
 
@@ -156,6 +156,7 @@ pcl::PointCloud<PointT>::Ptr cloud_filtered(new pcl::PointCloud<PointT>);
 
 
 vector<PointT> cens, cens_all;
+vector<jsk_recognition_msgs::BoundingBox> jsk_bboxs;
 visualization_msgs::MarkerArray m_s,l_s,current_m_a, tra_array, point_array, v_array, pred_point_array, self_v_array;
 visualization_msgs::MarkerArray detection_array;
 int max_size = 0;
@@ -166,9 +167,9 @@ float sigmaR=0.1;//0.1
 int id_count = 0; //the counter to calculate the current occupied track_id
 
 ////////////////////////kalman/////////////////////////
-#define frame_lost 5
+#define frame_lost 15
 #define detect_thres 2.5 //l=4.5,w=1.8 (4.7,1.86 for nu)
-#define bias 2.0 //5
+#define bias 5.0 //5 //2.0
 #define moving 1 //(10hz(0.1s) v>1m/s=60m/min=3.6km/hr = pedestrian)
 #define invalid_v 30 // 108km/hr
 #define show_tra 6
@@ -177,8 +178,8 @@ int id_count = 0; //the counter to calculate the current occupied track_id
 bool get_label = false;
 
 // KF init
-int stateDim=6;// [x,y,z,v_x,v_y,v_z]  + w.h.l.theta
-int measDim=3;// [x,y,z]
+int stateDim=10;// [x,y,z,v_x,v_y,v_z]  + w.h.l.theta
+int measDim=7;// [x,y,z,l,w,h,theta]
 int ctrlDim=0;// control input 0(acceleration=0,constant v model)
 std::vector<pcl::PointCloud<PointT>::Ptr> cluster_vec;
 
@@ -206,16 +207,51 @@ typedef struct track{
 
 
 std::vector<track> filters;
-
 ros::Time label_timestamp;
 
-
-vector<sensor_msgs::PointCloud2> lidar_msgs;
-
-string param,global,dataset,topic;
-bool use_detection = true;
+string dataset_,topic;
+bool global_frame_, use_detection_, output_, debug_;
 
 
+double get_yaw(const geometry_msgs::Quaternion quat){
+  tf::Quaternion q(quat.x, quat.y, quat.z, quat.w);
+  double roll, pitch, yaw;
+  tf::Matrix3x3(q).getRPY(roll, pitch, yaw);
+  return yaw;
+}
+
+
+double correct_yaw(const geometry_msgs::Quaternion det_quat, double trk_yaw){
+  double det_yaw = get_yaw(det_quat);
+  double diff = det_yaw - trk_yaw;
+
+  // correct from -2pi~2pi to -pi~pi
+  if (diff > M_PI){
+    det_yaw -= 2.0*M_PI;
+  }
+  else if (diff < (-1)*M_PI){
+    det_yaw += 2.0*M_PI;
+  }
+
+  double diff_small = det_yaw - trk_yaw;
+  // choose the smallest angle difference
+  if (diff_small > M_PI/2.0){
+    det_yaw -= M_PI;
+  }
+  else if (diff_small < M_PI/2.0){
+    det_yaw += M_PI;
+  }
+
+  double diff_small_2 = det_yaw - trk_yaw;
+  if (diff_small_2 > M_PI){
+    det_yaw -= 2.0*M_PI;
+  }
+  else if (diff_small_2 < (-1)*M_PI){
+    det_yaw += 2.0*M_PI;
+  }
+
+  return det_yaw;
+}
 
 
 // calculate euclidean distance of two points
@@ -224,14 +260,28 @@ double euclidean_distance(geometry_msgs::Point p1, geometry_msgs::Point p2)
   return sqrt((p1.x - p2.x) * (p1.x - p2.x) + (p1.y - p2.y) * (p1.y - p2.y) + (p1.z - p2.z) * (p1.z - p2.z));
 }
 
-double mahalanobis_distance(track trk, geometry_msgs::Point p2){
+// double mahalanobis_distance(track trk, geometry_msgs::Point p2){
+double mahalanobis_distance(track trk, jsk_recognition_msgs::BoundingBox p2){
   float t[measDim], det[measDim];
   t[0] = trk.pred_pose.x;
   t[1] = trk.pred_pose.y;
   t[2] = trk.pred_pose.z;
-  det[0] = p2.x;
-  det[1] = p2.y;
-  det[2] = p2.z;
+  t[3] = trk.kf.statePre.at<float>(3);
+  t[4] = trk.kf.statePre.at<float>(4);
+  t[5] = trk.kf.statePre.at<float>(5);
+  t[6] = trk.kf.statePre.at<float>(6);
+
+  det[0] = p2.pose.position.x;
+  det[1] = p2.pose.position.y;
+  det[2] = p2.pose.position.z;
+  det[3] = p2.dimensions.x;
+  det[4] = p2.dimensions.y;
+  det[5] = p2.dimensions.z;
+  det[6] = correct_yaw(p2.pose.orientation, trk.kf.statePre.at<float>(6));
+
+  if (debug_){
+    cout <<"After angle correction: " << det[6] - t[6] << endl;
+  }
   cv::Mat tk = cv::Mat(measDim, 1, CV_32F, t);
   cv::Mat d = cv::Mat(measDim, 1, CV_32F, det);
   
@@ -271,49 +321,53 @@ pcl::PointCloud<PointT>::Ptr compute_c(pcl::PointCloud<PointT>::Ptr cloud_cluste
 }
 
 
-int new_track(PointT cen, int idx){
+
+int new_track(const jsk_recognition_msgs::BoundingBox jsk_bbox, int idx){
     track tk;
     cv::KalmanFilter ka;
     ka.init(stateDim,measDim,ctrlDim,CV_32F);
-    ka.transitionMatrix = (Mat_<float>(6, 6) << 1,0,0,dt,0,0,
-                                                0,1,0,0,dt,0,
-                                                0,0,1,0,0,dt,
-                                                0,0,0,1,0,0,
-                                                0,0,0,0,1,0,
-                                                0,0,0,0,0,1);
+    // ka.transitionMatrix = (Mat_<float>(6, 6) << 1,0,0,dt,0,0,
+    //                                             0,1,0,0,dt,0,
+    //                                             0,0,1,0,0,dt,
+    //                                             0,0,0,1,0,0,
+    //                                             0,0,0,0,1,0,
+    //                                             0,0,0,0,0,1);
+    // x,y,z,l,w,h,theat,vx,vy,vz
+    ka.transitionMatrix = (Mat_<float>(stateDim, stateDim) << 1,0,0,0,0,0,0,dt,0,0,
+                                                              0,1,0,0,0,0,0,0,dt,0,
+                                                              0,0,1,0,0,0,0,0,0,dt,
+                                                              0,0,0,1,0,0,0,0,0,0,
+                                                              0,0,0,0,1,0,0,0,0,0,
+                                                              0,0,0,0,0,1,0,0,0,0,
+                                                              0,0,0,0,0,0,1,0,0,0,
+                                                              0,0,0,0,0,0,0,1,0,0,
+                                                              0,0,0,0,0,0,0,0,1,0,
+                                                              0,0,0,0,0,0,0,0,0,1);
     cv::setIdentity(ka.measurementMatrix);
     cv::setIdentity(ka.processNoiseCov, Scalar::all(sigmaQ));
     cv::setIdentity(ka.measurementNoiseCov, cv::Scalar(sigmaR));
-    ka.statePost.at<float>(0)=cen.x;
-    ka.statePost.at<float>(1)=cen.y;
-    ka.statePost.at<float>(2)=cen.z;
-    ka.statePost.at<float>(3)=0;// initial v_x
-    ka.statePost.at<float>(4)=0;// initial v_y
-    ka.statePost.at<float>(5)=0;// initial v_z
+    ka.statePost.at<float>(0)= jsk_bbox.pose.position.x;
+    ka.statePost.at<float>(1)= jsk_bbox.pose.position.y;
+    ka.statePost.at<float>(2)= jsk_bbox.pose.position.z;
+    ka.statePost.at<float>(3)= jsk_bbox.dimensions.x;// l
+    ka.statePost.at<float>(4)= jsk_bbox.dimensions.y;// w
+    ka.statePost.at<float>(5)= jsk_bbox.dimensions.z;// h
+    ka.statePost.at<float>(6)= get_yaw(jsk_bbox.pose.orientation);// theta
+    ka.statePost.at<float>(7)= 0;// initial v_x
+    ka.statePost.at<float>(8)= 0;// initial v_y
+    ka.statePost.at<float>(9)= 0;// initial v_z
 
+    ka.errorCovPost = (Mat_<float>(stateDim, stateDim) << 1,0,0,0,0,0,0,0,0,0,
+                                                          0,1,0,0,0,0,0,0,0,0,
+                                                          0,0,1,0,0,0,0,0,0,0,
+                                                          0,0,0,1,0,0,0,0,0,0,
+                                                          0,0,0,0,1,0,0,0,0,0,
+                                                          0,0,0,0,0,1,0,0,0,0,
+                                                          0,0,0,0,0,0,1,0,0,0,
+                                                          0,0,0,0,0,0,0,1000.0,0,0,
+                                                          0,0,0,0,0,0,0,0,1000.0,0,
+                                                          0,0,0,0,0,0,0,0,0,1000.0);
 
-    ka.errorCovPost = (Mat_<float>(6, 6) << 1,0,0,0,0,0,
-                                            0,1,0,0,0,0,
-                                            0,0,1,0,0,0,
-                                            0,0,0,10.0,0,0,
-                                            0,0,0,0,10.0,0,
-                                            0,0,0,0,0,10.0);
-
-
-    
-    
-    //predict phase to generate statePre( state X(K|K-1) ), to correct to X(K|K) 
-    // geometry_msgs::Point pt, pt_v;
-    // cv::Mat pred;
-    // pred = ka.predict();
-    // pt.x = pred.at<float>(0);
-    // pt.y = pred.at<float>(1);
-    // pt.z = pred.at<float>(2);
-    // pt_v.x = pred.at<float>(3);
-    // pt_v.y = pred.at<float>(4);
-    // pt_v.z = pred.at<float>(5);
-    // tk.pred_pose = pt;
-    // tk.pred_v = pt_v;
     
 
     tk.kf = ka;
@@ -325,9 +379,9 @@ int new_track(PointT cen, int idx){
 
     //
     geometry_msgs::Point pt_his;
-    pt_his.x = cen.x;
-    pt_his.y = cen.y;
-    pt_his.z = cen.z;
+    pt_his.x = jsk_bbox.pose.position.x;
+    pt_his.y = jsk_bbox.pose.position.y;
+    pt_his.z = jsk_bbox.pose.position.z;
     tk.history.push_back(pt_his);
 
     // tk.uuid = ++id_count;
@@ -440,15 +494,166 @@ void get_detection(const argo_detection::DetectionArray detections, tf::StampedT
     tf::Point pt(temp.point.x, temp.point.y, temp.point.z);
     tf::Point ptTransform = transform * pt;
 
-    PointT bbox;
-    bbox.x = ptTransform.x();
-    bbox.y = ptTransform.y();
-    bbox.z = ptTransform.z();
-    cens.push_back(bbox);
+    // PointT bbox;
+    // bbox.x = ptTransform.x();
+    // bbox.y = ptTransform.y();
+    // bbox.z = ptTransform.z();
+    // cens.push_back(bbox);
+
+    // transform local to global
+    geometry_msgs::PoseStamped pose_global;
+    tf::Transform pose_local;
+    pose_local.setOrigin(tf::Vector3(objects.points.at(i).center.x, objects.points.at(i).center.y, objects.points.at(i).center.z));
+    pose_local.setRotation(tf::Quaternion(objects.points.at(i).rotation.x, objects.points.at(i).rotation.y,\
+                                         objects.points.at(i).rotation.z, objects.points.at(i).rotation.w));
+
+    tf::poseTFToMsg( transform * pose_local, pose_global.pose);
+
+    jsk_recognition_msgs::BoundingBox bbox;
+    bbox.header.stamp = detections.header.stamp;
+    bbox.header.frame_id = FRAME;
+    bbox.pose = pose_global.pose;
+    // bbox.pose.position.x = ptTransform.x();
+    // bbox.pose.position.y = ptTransform.y();
+    // bbox.pose.position.z = ptTransform.z();
+    bbox.dimensions.x = objects.points.at(i).length;
+    bbox.dimensions.y = objects.points.at(i).width;
+    bbox.dimensions.z = objects.points.at(i).height;
+
+    // !!!! quaternion也要轉
+    // bbox.pose.orientation.x = objects.points.at(i).rotation.x;
+    // bbox.pose.orientation.y = objects.points.at(i).rotation.y;
+    // bbox.pose.orientation.z = objects.points.at(i).rotation.z;
+    // bbox.pose.orientation.w = objects.points.at(i).rotation.w;
+    jsk_bboxs.push_back(bbox);
+    // bbox.label = ; uint32
+
+    jsk_recognition_msgs::BoundingBoxArray jsk_bboxs_array;
+    for (int i=0; i<jsk_bboxs.size(); i++){
+      jsk_bboxs_array.header = jsk_bboxs.at(i).header;
+      jsk_bboxs_array.boxes.push_back(jsk_bboxs.at(i));
+    }
+    pub_jsk_bbox.publish(jsk_bboxs_array);
   }
 
   return;
 }
+
+
+void ground_remove(const sensor_msgs::PointCloud2 out){
+  pcl::fromROSMsg(out,*cloud_pcl_whole);  
+  pcl::ModelCoefficients::Ptr coefficients (new pcl::ModelCoefficients);
+  pcl::PointIndices::Ptr inliers (new pcl::PointIndices);
+  // Create the segmentation object
+  pcl::SACSegmentation<PointT> seg;
+  // Optional
+  seg.setOptimizeCoefficients (true);
+  // Mandatory
+  seg.setModelType (pcl::SACMODEL_PLANE);
+  seg.setMethodType (pcl::SAC_RANSAC);
+  seg.setMaxIterations (100);
+  seg.setDistanceThreshold (0.02);//0.01 for bag1
+
+  //Chose ROI to process
+  //cloud_pcl = crop(cloud_pcl_whole);
+  *cloud_pcl = *cloud_pcl_whole;
+
+  cout<<"Ready to segmentation."<<endl;
+  pcl::ExtractIndices<PointT> extract;
+  pcl::console::TicToc ground_timer;
+  ground_timer.tic();
+  int i = 0;
+  // for(i=0;i<iteration;i++){
+  while( cloud_pcl->points.size() > 0.3*int(cloud_pcl_whole->points.size()) ){
+  // Segment the largest planar component from the remaining cloud
+    seg.setInputCloud (cloud_pcl);
+    seg.segment (*inliers, *coefficients);
+    if (inliers->indices.size () == 0)
+    {
+      std::cerr << "Could not estimate a planar model for the given dataset." << std::endl;
+      break;
+    }
+
+    // Extract the inliers
+    extract.setInputCloud (cloud_pcl);
+    extract.setIndices (inliers);
+    extract.setNegative (true);
+    extract.filter (*cloud_f);
+    cloud_pcl.swap (cloud_f);
+    i++;
+    //cout<<i<<endl;
+  }
+  cout<<"Ground removal takes "<<ground_timer.toc()/1000<<" secs.\n";
+  cout<<"Before removal: " << cloud_pcl_whole->points.size()<<endl;
+  cout<<"It runs "<<i<<" times.\n";
+  cout<<"After removal: " << cloud_pcl->points.size() <<endl;
+  cout<<"The ratio: "<<cloud_pcl->points.size()/cloud_pcl_whole->points.size() << endl;
+
+  sensor_msgs::PointCloud2  output;
+  pcl::toROSMsg(*cloud_pcl,output);
+  output.header.frame_id = FRAME;
+  pub.publish(output);
+}
+
+
+void euc_cluster(void){
+    pcl::console::TicToc cluster_timer;
+    cluster_timer.tic();
+    pcl::search::KdTree<pcl::PointXYZI>::Ptr tree (new pcl::search::KdTree<pcl::PointXYZI>);
+    tree->setInputCloud (cloud_filtered);
+
+    std::vector<pcl::PointIndices> cluster_indices;
+    pcl::EuclideanClusterExtraction<pcl::PointXYZI> ec;
+
+    ec.setClusterTolerance (0.45); //0.5->cars merged to one cluster
+    ec.setMinClusterSize (40); //25 for clustering_1hz 6f bag 
+    ec.setMaxClusterSize (400); //300 for train2,400 for train1(truck)
+    ec.setSearchMethod (tree);
+    ec.setInputCloud (cloud_filtered);
+    ec.extract (cluster_indices);
+    std::cout << "Cluster size: " << cluster_indices.size() << std::endl;
+    
+    cout<<"Cluster takes "<<cluster_timer.toc()/1000 << " secs.\n";
+
+    int j = 50;
+
+    pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_clusters (new pcl::PointCloud<pcl::PointXYZI>);
+    
+    cens_all.clear();
+    cens.clear();
+    cluster_vec.clear();
+
+    for (std::vector<pcl::PointIndices>::const_iterator it = cluster_indices.begin (); it != cluster_indices.end (); ++it) {
+      
+      // extract clusters and save as a single point cloud
+      pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_cluster (new pcl::PointCloud<pcl::PointXYZI>);
+      for (std::vector<int>::const_iterator pit = it->indices.begin (); pit != it->indices.end (); ++pit) {
+        cloud_filtered->points[*pit].intensity = j;
+        cloud_cluster->points.push_back (cloud_filtered->points[*pit]); //*
+      }
+      cloud_cluster->width = cloud_cluster->points.size ();
+      cloud_cluster->height = 1;
+      cloud_cluster->is_dense = true;
+      
+      // compute cluster centroid and publish
+      cloud_cluster = compute_c(cloud_cluster,j);
+      cluster_vec.push_back(cloud_cluster);
+
+      *cloud_clusters += *cloud_cluster;
+      j+=2;
+
+    }
+    
+    cout<< "cens_all ="<<cens_all.size()<<endl;
+    cout<< "cens ="<<cens.size()<<endl;
+    // cout << get_label << endl;
+
+    sensor_msgs::PointCloud2 colored_pc;
+    pcl::toROSMsg(*cloud_clusters, colored_pc);
+    colored_pc.header.frame_id=FRAME;
+    pub_colored.publish(colored_pc);
+}
+
 
 void filter_cluster(void){
   cout<<"Filtering the cluster.\n";
@@ -569,7 +774,7 @@ void filter_cluster(void){
 void show_id(vector<int>obj_id){
     int k;
     visualization_msgs::Marker marker;
-    for(k=0; k<cens.size(); k++){
+    for(k=0; k<jsk_bboxs.size(); k++){
     //   marker.header.frame_id="/nuscenes_lidar"; //child of pointcloud of tf map
       // marker.header.frame_id="/scan";
       // if ( !(global.compare("global")) )
@@ -585,18 +790,17 @@ void show_id(vector<int>obj_id){
       marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
 
       marker.scale.z = 1.5f;
-      // marker.color.b = 1.0f;
-      // marker.color.g = 1.0f;
-      // marker.color.r = 0;
       marker.color.b = 0.0f;//yellow
       marker.color.g = 0.9f;
       marker.color.r = 0.9f;
       marker.color.a = 1;
 
       geometry_msgs::Pose pose;
-      pose.position.x = cens[k].x;
-      pose.position.y = cens[k].y;
-      pose.position.z = cens[k].z+1.0f;
+      // pose.position.x = cens[k].x;
+      // pose.position.y = cens[k].y;
+      // pose.position.z = cens[k].z+1.0f;
+      pose.position = jsk_bboxs.at(k).pose.position;
+      pose.position.z = jsk_bboxs.at(k).pose.position.z + 1.0f;
      
       stringstream ss;
       ss << obj_id.at(k);
@@ -604,7 +808,7 @@ void show_id(vector<int>obj_id){
       marker.text = ss.str();
       marker.pose = pose;
       m_s.markers.push_back(marker);
-      }
+    }
 
     // if (m_s.markers.size() > max_size)
     //   max_size = m_s.markers.size();
@@ -717,7 +921,8 @@ void show_velocity(){
     pred.z = filters.at(k).pred_v.z;
     float velocity = sqrt(pred.x*pred.x + pred.y*pred.y + pred.z*pred.z);
 
-    if ( velocity >= moving && velocity < invalid_v && !(filters.at(k).state.compare("tracking")) ){
+    // if ( velocity >= moving && velocity < invalid_v && !(filters.at(k).state.compare("tracking")) ){
+    if ( !(filters.at(k).state.compare("tracking")) ){
       visualization_msgs::Marker arrow;
       arrow.header.frame_id = FRAME;
       arrow.header.stamp = ros::Time();
@@ -809,25 +1014,19 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
     pt.x = pred.at<float>(0);
     pt.y = pred.at<float>(1);
     pt.z = pred.at<float>(2);
-    pt_v.x = pred.at<float>(3);
-    pt_v.y = pred.at<float>(4);
-    pt_v.z = pred.at<float>(5);
+    pt_v.x = pred.at<float>(7);
+    pt_v.y = pred.at<float>(8);
+    pt_v.z = pred.at<float>(9);
     filters.at(i).pred_pose = pt;
     filters.at(i).pred_v = pt_v;
-
-    // float velocity;
-    // velocity = sqrt(pt_v.x*pt_v.x + pt_v.y*pt_v.y + pt_v.z*pt_v.z);
-    // cout<<"The v for "<<filters.at(i).uuid<<" is " << velocity << endl;
   }
 
   std::vector<geometry_msgs::Point> clusterCenters;
   
   int i=0;
-  for(i; i<cens.size(); i++){
+  for(i; i<jsk_bboxs.size(); i++){
     geometry_msgs::Point pt;
-    pt.x=cens[i].x;
-    pt.y=cens[i].y;
-    pt.z=cens[i].z;
+    pt = jsk_bboxs.at(i).pose.position;
     clusterCenters.push_back(pt);
   }
 
@@ -840,7 +1039,7 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
   {
       std::vector<double> distVec; //float
       if (!use_mahalanobis){
-        for(int n=0;n<cens.size();n++)
+        for(int n=0;n<jsk_bboxs.size();n++)
         {
           distVec.push_back(euclidean_distance((*it).pred_pose,clusterCenters[n]));
         }
@@ -849,10 +1048,13 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
         cv::KalmanFilter k = (*it).kf;
         cv::Mat S = (k.measurementMatrix * k.errorCovPre) * k.measurementMatrix.t() + k.measurementNoiseCov;
         cv::Mat S_inv = S.inv();
-        cout << "The tracker " << std::setw(3) << (*it).uuid << ", state " << std::setw(8) << (*it).state << ", S_inv: " << std::fixed << std::setprecision(5) << S_inv.at<float>(0,0) <<", lose frame: "<<(*it).lose_frame<< endl;
-        for(int n=0;n<cens.size();n++)
+        if( debug_ ){
+          cout << "The tracker " << std::setw(3) << (*it).uuid << ", state " << std::setw(8) << (*it).state << ", S_inv: " << std::fixed << std::setprecision(5) << S_inv.at<float>(0,0) <<", lose frame: "<<(*it).lose_frame<< endl;
+        }
+        for(int n=0;n<jsk_bboxs.size();n++)
         {
-          distVec.push_back( mahalanobis_distance( (*it), clusterCenters[n] ));
+          // distVec.push_back( mahalanobis_distance( (*it), clusterCenters[n] ));
+          distVec.push_back( mahalanobis_distance( (*it), jsk_bboxs.at(n) ));
         }
       }
       
@@ -965,7 +1167,7 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
   // std::cout << "\ncost: " << cost << std::endl;
 
 
-  std::vector<int> obj_id(cens.size(),-1); 
+  std::vector<int> obj_id(jsk_bboxs.size(),-1); 
   int k=0;
   for(k=0; k<filters.size(); k++){
     std::vector<double> dist_vec = distMat.at(k); //float
@@ -977,15 +1179,20 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
     //-1 for non matched tracks, gating function : use velocity to filter out impossible matching
     if ( assignment[k] != -1 ){
       int clus_idx = assignment[k];
-      if (fabs( cens.at(clus_idx).x - current_track->history.back().x ) < fabs(current_track->pred_v.x) * dt + bias && \
-          fabs( cens.at(clus_idx).y - current_track->history.back().y ) < fabs(current_track->pred_v.y) * dt + bias){
+      if (fabs( jsk_bboxs.at(clus_idx).pose.position.x - current_track->history.back().x ) < fabs(current_track->pred_v.x) * dt + bias && \
+          fabs( jsk_bboxs.at(clus_idx).pose.position.y - current_track->history.back().y ) < fabs(current_track->pred_v.y) * dt + bias){
         
         obj_id.at(clus_idx) = current_track->uuid;
         current_track->cluster_idx = clus_idx;
         current_track->state = "tracking";
-        cout << "The track " << current_track->uuid << " dist is " << distMat[k][clus_idx] << endl;
+        // if (debug_){
+          cout << "The track " << current_track->uuid << " dist is " << distMat[k][clus_idx] << endl;
+      //   }
       }
       else{
+        // if(debug_){
+          cout << "FILTERED OUT！！" << " The track " << current_track->uuid << " dist is " << distMat[k][clus_idx] << endl;
+        // }
         current_track->state = "lost";
       }  
     }
@@ -1014,20 +1221,22 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
 
           //record the tracking trajectory
           geometry_msgs::Point pt_his;
-          pt_his.x = cens.at((*pit).cluster_idx).x;
-          pt_his.y = cens.at((*pit).cluster_idx).y;
-          pt_his.z = cens.at((*pit).cluster_idx).z;
+          pt_his = jsk_bboxs.at((*pit).cluster_idx).pose.position;
+          // pt_his.x = cens.at((*pit).cluster_idx).x;
+          // pt_his.y = cens.at((*pit).cluster_idx).y;
+          // pt_his.z = cens.at((*pit).cluster_idx).z;
           (*pit).history.push_back(pt_his);
 
       }    
       
-      if (!(*pit).state.compare("tracking"))
-          cout<< std::setw(3) << (*pit).uuid<<" tracker is \033[1;34m"<< std::setw(8) <<(*pit).state<< std::setw(9) << "\033[0m, track: "<<(*pit).track_frame << ", to cluster_idx "<< (*pit).cluster_idx <<endl;
-      else if (!(*pit).state.compare("lost"))
-          cout<< std::setw(3) <<(*pit).uuid<<" tracker is \033[1;34m"<< std::setw(8) <<(*pit).state<< std::setw(9) << "\033[0m, lost: "<<(*pit).lose_frame<<endl;
-      else
-          cout<<"\033[1;31mUndefined state for tracked "<<k<<"\033[0m"<<endl;
-
+      if(debug_){
+        if (!(*pit).state.compare("tracking"))
+           cout<< std::setw(3) << (*pit).uuid<<" tracker is \033[1;34m"<< std::setw(8) <<(*pit).state<< std::setw(9) << "\033[0m, track: "<<(*pit).track_frame << ", to cluster_idx "<< (*pit).cluster_idx <<endl;
+        else if (!(*pit).state.compare("lost"))
+            cout<< std::setw(3) <<(*pit).uuid<<" tracker is \033[1;34m"<< std::setw(8) <<(*pit).state<< std::setw(9) << "\033[0m, lost: "<<(*pit).lose_frame<<endl;
+        else
+            cout<<"\033[1;31mUndefined state for tracked "<<k<<"\033[0m"<<endl;
+      }
 
       // if we lose track consecutively ''frame_lost'' frames, remove track
       if ( (*pit).lose_frame == frame_lost )
@@ -1063,19 +1272,28 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
   
   ///////////////////////////////////////////////////estimate(update old/existing tracks)
   int num = filters.size();
-  float meas[num][3];
+  float meas[num][measDim];
   i = 0;
   for(std::vector<track>::const_iterator it = filters.begin(); it != filters.end(); ++it){
       if ( (*it).state == "tracking" ){
-          PointT pt = cens[(*it).cluster_idx];
-          meas[i][0] = pt.x;
-          meas[i][1] = pt.y;
-          meas[i][2] = pt.z;
+          // PointT pt = cens[(*it).cluster_idx];
+          // meas[i][0] = pt.x;
+          // meas[i][1] = pt.y;
+          // meas[i][2] = pt.z;
+          jsk_recognition_msgs::BoundingBox bbox = jsk_bboxs.at((*it).cluster_idx);
+          meas[i][0] = bbox.pose.position.x;
+          meas[i][1] = bbox.pose.position.y;
+          meas[i][2] = bbox.pose.position.z;
+          meas[i][3] = bbox.dimensions.x;
+          meas[i][4] = bbox.dimensions.y;
+          meas[i][5] = bbox.dimensions.z;
+          meas[i][6] = get_yaw(bbox.pose.orientation);
+          
       }
       else if ( (*it).state == "lost" ){
-          meas[i][0] = (*it).pred_pose.x; //+ (*it).pred_v.x;
-          meas[i][1] = (*it).pred_pose.y;//+ (*it).pred_v.y;
-          meas[i][2] = (*it).pred_pose.z; //+ (*it).pred_v.z;
+          // meas[i][0] = (*it).pred_pose.x; //+ (*it).pred_v.x;
+          // meas[i][1] = (*it).pred_pose.y;//+ (*it).pred_v.y;
+          // meas[i][2] = (*it).pred_pose.z; //+ (*it).pred_v.z;
       }
       else{
           std::cout<<"Some tracks state not defined to tracking/lost."<<std::endl;
@@ -1093,15 +1311,16 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
   cv::Mat estimated[num];
   i = 0;
   for(std::vector<track>::iterator it = filters.begin(); it != filters.end(); ++it){
-      estimated[i] = (*it).kf.correct(measMat[i]); 
+      if ((*it).state == "tracking")
+        estimated[i] = (*it).kf.correct(measMat[i]); 
       i++;
   }
 
 
   //initiate new tracks for unmatched cluster obj.at(cluster_idx) == -1
-  for (i=0; i<cens.size(); i++){
+  for (i=0; i<jsk_bboxs.size(); i++){
     if(obj_id.at(i) == -1){
-      int track_uuid = new_track(cens.at(i),i);
+      int track_uuid = new_track(jsk_bboxs.at(i),i);
       obj_id.at(i) = track_uuid;
     }
   }
@@ -1109,7 +1328,7 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
 
   // obj_id now is the traking result of all cens, done associate. if remain -1 => false positive(alarm)
   //////output result
-  if ( !(param.compare("output")) ){
+  if( output_ ){
     for (int i=0; i<obj_id.size(); i++){
       outputFile << det_timestamp << "," << obj_id.at(i) << "," << cens.at(i).x << "," << cens.at(i).y << "," << cens.at(i).z << endl; 
       // outputFile << label_timestamp << "," << obj_id.at(i) << "," << cens.at(i).x << "," << cens.at(i).y << "," << cens.at(i).z << endl;//in get_bbox, we don't care lidar point cloud, just get marker and do
@@ -1118,7 +1337,7 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
 
   ROS_INFO("We now have %d tracks.", (int)filters.size());
 
-  m_s.markers.resize(cens.size());
+  m_s.markers.resize(jsk_bboxs.size());
   m_s.markers.clear();
   tra_array.markers.clear();
   point_array.markers.clear();
@@ -1264,23 +1483,13 @@ void callback(const sensor_msgs::PointCloud2ConstPtr& cloud, const argo_detectio
   // }
 
 
-
-
-  
-  now_scan = msg;  
   sensor_msgs::PointCloud2 out;
   sensor_msgs::PointCloud out_2,out_transformed_2;
   out = msg;
-  // out.header.frame_id="/map";
-  // pub_get.publish(out);
-  // cout<<"I get the car. at "<<lidar_timestamp<<endl; //(2) on test off
 
-  
-  //test transform to global, not succeed yet
-  /////////////////////////////////////////////////////////////////////////(1)
   //transform point cloud to map frame by tf
   tf::StampedTransform transform;
-  if ( !(global.compare("global")) ){
+  if ( global_frame_ ){
     sensor_msgs::convertPointCloud2ToPointCloud(out, out_2);
     try {
         // tf_listener->waitForTransform("/map", "/scan", ros::Time(0), ros::Duration(5.0));
@@ -1304,66 +1513,12 @@ void callback(const sensor_msgs::PointCloud2ConstPtr& cloud, const argo_detectio
   cout<<"I get the car. at "<<lidar_timestamp<<endl;
   ///test
   
-  if (!use_detection){
-  // 改用ground_filter進來的點雲 /no_ground
-   // GROUND
-    pcl::fromROSMsg(out,*cloud_pcl_whole);  
-    pcl::ModelCoefficients::Ptr coefficients (new pcl::ModelCoefficients);
-    pcl::PointIndices::Ptr inliers (new pcl::PointIndices);
-    // Create the segmentation object
-    pcl::SACSegmentation<PointT> seg;
-    // Optional
-    seg.setOptimizeCoefficients (true);
-    // Mandatory
-    seg.setModelType (pcl::SACMODEL_PLANE);
-    seg.setMethodType (pcl::SAC_RANSAC);
-    seg.setMaxIterations (100);
-    seg.setDistanceThreshold (0.02);//0.01 for bag1
+  if (!use_detection_){
+    // 改用ground_filter進來的點雲 /no_ground
+    // GROUND
+    ground_remove(out);
 
-    //Chose ROI to process
-    // cloud_pcl = crop(cloud_pcl_whole);
-    *cloud_pcl = *cloud_pcl_whole;
-
-    cout<<"Ready to segmentation."<<endl;
-    pcl::ExtractIndices<PointT> extract;
-    pcl::console::TicToc ground_timer;
-    ground_timer.tic();
-    int i = 0;
-    // for(i=0;i<iteration;i++){
-    while( cloud_pcl->points.size() > 0.3*int(cloud_pcl_whole->points.size()) ){
-    // Segment the largest planar component from the remaining cloud
-      seg.setInputCloud (cloud_pcl);
-      seg.segment (*inliers, *coefficients);
-      if (inliers->indices.size () == 0)
-      {
-        std::cerr << "Could not estimate a planar model for the given dataset." << std::endl;
-        break;
-      }
-
-      // Extract the inliers
-      extract.setInputCloud (cloud_pcl);
-      extract.setIndices (inliers);
-
-      extract.setNegative (true);
-      extract.filter (*cloud_f);
-      cloud_pcl.swap (cloud_f);
-      i++;
-      //cout<<i<<endl;
-    }
-    cout<<"Ground removal takes "<<ground_timer.toc()/1000<<" secs.\n";
-    cout<<"Before removal: " << cloud_pcl_whole->points.size()<<endl;
-    cout<<"It runs "<<i<<" times.\n";
-    cout<<"After removal: " << cloud_pcl->points.size() <<endl;
-    cout<<"The ratio: "<<cloud_pcl->points.size()/cloud_pcl_whole->points.size() << endl;
-
-    pcl::toROSMsg(*cloud_pcl,output);
-    output.header.frame_id = FRAME;
-    pub.publish(output);
-    // 
-
-    pcl::fromROSMsg(out,*cloud_pcl);  
-
-  ////////////////////no downsampling
+    ////////////////////no downsampling
     pcl::VoxelGrid<PointT> sor;
     sor.setInputCloud (cloud_pcl);
     sor.setLeafSize (0.25f, 0.25f, 0.25f); //0.25 for bag1; 0.1 for 3 //vedio 0.35 not many pedestrain,0.25better
@@ -1373,67 +1528,14 @@ void callback(const sensor_msgs::PointCloud2ConstPtr& cloud, const argo_detectio
     cloud_filtered_sensor.header.frame_id = FRAME;
     pub_voxel.publish(cloud_filtered_sensor);
 
-
     //cluster
-    pcl::console::TicToc cluster_timer;
-    cluster_timer.tic();
-    pcl::search::KdTree<pcl::PointXYZI>::Ptr tree (new pcl::search::KdTree<pcl::PointXYZI>);
-    tree->setInputCloud (cloud_filtered);
-
-    std::vector<pcl::PointIndices> cluster_indices;
-    pcl::EuclideanClusterExtraction<pcl::PointXYZI> ec;
-
-    ec.setClusterTolerance (0.45); //0.5->cars merged to one cluster
-    ec.setMinClusterSize (40); //25 for clustering_1hz 6f bag 
-    ec.setMaxClusterSize (400); //300 for train2,400 for train1(truck)
-    ec.setSearchMethod (tree);
-    ec.setInputCloud (cloud_filtered);
-    ec.extract (cluster_indices);
-    std::cout << "Cluster size: " << cluster_indices.size() << std::endl;
-    
-    cout<<"Cluster takes "<<cluster_timer.toc()/1000 << " secs.\n";
-
-    int j = 50;
-
-    pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_clusters (new pcl::PointCloud<pcl::PointXYZI>);
-    
-    cens_all.clear();
-    cens.clear();
-    cluster_vec.clear();
-
-    for (std::vector<pcl::PointIndices>::const_iterator it = cluster_indices.begin (); it != cluster_indices.end (); ++it) {
-      
-      // extract clusters and save as a single point cloud
-      pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_cluster (new pcl::PointCloud<pcl::PointXYZI>);
-      for (std::vector<int>::const_iterator pit = it->indices.begin (); pit != it->indices.end (); ++pit) {
-        cloud_filtered->points[*pit].intensity = j;
-        cloud_cluster->points.push_back (cloud_filtered->points[*pit]); //*
-      }
-      cloud_cluster->width = cloud_cluster->points.size ();
-      cloud_cluster->height = 1;
-      cloud_cluster->is_dense = true;
-      
-      // compute cluster centroid and publish
-      cloud_cluster = compute_c(cloud_cluster,j);
-      cluster_vec.push_back(cloud_cluster);
-
-      *cloud_clusters += *cloud_cluster;
-      j+=2;
-
-    }
-    
-    cout<< "cens_all ="<<cens_all.size()<<endl;
-    cout<< "cens ="<<cens.size()<<endl;
-    // cout << get_label << endl;
-
-    sensor_msgs::PointCloud2 colored_pc;
-    pcl::toROSMsg(*cloud_clusters, colored_pc);
-    colored_pc.header.frame_id=FRAME;
-    pub_colored.publish(colored_pc);
+    euc_cluster();
+ 
   }
   /////////////////////////////done cluster
   else{
     cens.clear();
+    jsk_bboxs.clear();
     get_detection(*detection, transform);
   }
 
@@ -1462,16 +1564,16 @@ void callback(const sensor_msgs::PointCloud2ConstPtr& cloud, const argo_detectio
   */
 
   if( firstFrame ){
-    int current_id = cens.size();
+    int current_id = jsk_bboxs.size();
     for (int i=0; i<current_id; i++){
-      int uuid = new_track(cens.at(i), i);
+      int uuid = new_track(jsk_bboxs.at(i), i);
     }
-    cout << "We have " << cens.size() << " detections" << endl;
+    cout << "We have " << jsk_bboxs.size() << " detections" << endl;
     cout<<"Initiate "<<filters.size()<<" tracks."<<endl;
 
     m_s.markers.clear();
-    std::vector<int> obj_id(cens.size(),-1);
-    for(int i =0; i<cens.size(); i++){
+    std::vector<int> obj_id(jsk_bboxs.size(),-1);
+    for(int i =0; i<jsk_bboxs.size(); i++){
       obj_id.at(i) = i;
     }
     show_id(obj_id);
@@ -1552,21 +1654,23 @@ int main(int argc, char** argv){
   ros::NodeHandle nh("~");
   string out_dir = ros::package::getPath("lidar_track");
 
-
-  nh.getParam("dataset", dataset);
-  nh.getParam("param", param);
-  nh.getParam("global",global);
-  nh.getParam("use_detection", use_detection);  
+  // rosrun lidar_track kal_update _dataset:=argo _output:= _global_frame:=true _use_detection:=true
+  nh.param<string>("dataset", dataset_, "argo");
+  nh.param<bool>("output", output_, false);
+  nh.param<bool>("global_frame", global_frame_, true);
+  nh.param<bool>("use_detection", use_detection_, true);
+  nh.param<bool>("debug", debug_, false);
 
   //用nh.param("globel", global, defaultvalue);
   //在callback裡面取得msg.header.frame_id當成inputid, 這個FRAME為outputid, 用這個方式轉transform
 
-  if (!(dataset.compare("nuscene"))){
+  if (!(dataset_.compare("nuscene"))){
     topic = "/nuscenes_lidar";
     ROS_INFO("On nuscene dataset, subscribe to %s", topic.c_str());
   }
-  else if (!(dataset.compare("argo"))){
+  else if (!(dataset_.compare("argo"))){
     topic = "/scan";
+    // topic = "/point_cloud";
     ROS_INFO("On argo dataset, subscribe to %s", topic.c_str());
   }
   else{
@@ -1575,7 +1679,8 @@ int main(int argc, char** argv){
   }
 
 
-  if( !(param.compare("output")) ){
+  // if( !(param.compare("output")) ){
+  if ( output_ ){
     string filename = "detection_6f.csv";
     outputFile.open(out_dir + "/output/" + filename);
     ROS_INFO("Output file : %s", filename.c_str());
@@ -1584,18 +1689,18 @@ int main(int argc, char** argv){
   else
     ROS_INFO("No output recorded.");
 
-  if( !(global.compare("global")) ){
+  if( global_frame_ ){
     FRAME = "/map";
   }
   else{
-    if (!(dataset.compare("nuscene")))
+    if (!(dataset_.compare("nuscene")))
       FRAME = "/nuscenes_lidar";
     else
       FRAME = "/scan"; 
   }
 
   ROS_INFO("We now at %s frame", FRAME.c_str());
-  ROS_INFO("Using detection : %s", (use_detection ? "true" : "false") );
+  ROS_INFO("Using detection : %s", (use_detection_ ? "true" : "false") );
 
  
   
@@ -1608,8 +1713,10 @@ int main(int argc, char** argv){
   // sub = nh.subscribe( topic,1,&callback);
 
   // sub = nh.subscribe( "/no_ground",1,&callback);
-  message_filters::Subscriber<sensor_msgs::PointCloud2> sub(nh, topic, 500);
-  message_filters::Subscriber<argo_detection::DetectionArray> det_sub(nh, "/detection", 500);
+  message_filters::Subscriber<sensor_msgs::PointCloud2> sub(nh, topic, 100);
+  message_filters::Subscriber<argo_detection::DetectionArray> det_sub(nh, "/detection", 100);
+  // message_filters::Subscriber<argo_detection::DetectionArray> det_sub(nh, "/detection/lidar_objects", 500);
+  
   // message_filters::TimeSynchronizer<sensor_msgs::PointCloud2, argo_detection::DetectionArray> sync(sub, det_sub, 100);
   // sync.registerCallback(boost::bind(&callback, _1, _2));
   message_filters::Synchronizer<GetSync>* sync_filter;
@@ -1630,6 +1737,7 @@ int main(int argc, char** argv){
   pub_self_v = nh.advertise<visualization_msgs::MarkerArray>("self_v_marker",1);
   pub_detection = nh.advertise<visualization_msgs::MarkerArray>("detection_marker", 1);
   
+  pub_jsk_bbox = nh.advertise<jsk_recognition_msgs::BoundingBoxArray>("jsk_output_global",1);
 
   // tf::TransformListener listener;
   tf_listener = new tf::TransformListener();
