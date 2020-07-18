@@ -210,7 +210,7 @@ std::vector<track> filters;
 ros::Time label_timestamp;
 
 string dataset_,topic;
-bool global_frame_, use_detection_, output_, debug_;
+bool global_frame_, use_detection_, output_, debug_, motion_flag_;
 
 
 double get_yaw(const geometry_msgs::Quaternion quat){
@@ -238,10 +238,11 @@ double correct_yaw(const geometry_msgs::Quaternion det_quat, double trk_yaw){
   if (diff_small > M_PI/2.0){
     det_yaw -= M_PI;
   }
-  else if (diff_small < M_PI/2.0){
+  else if (diff_small < (-1)*M_PI/2.0){
     det_yaw += M_PI;
   }
 
+  // 0~90 or 0~-90, get accurate diff angle
   double diff_small_2 = det_yaw - trk_yaw;
   if (diff_small_2 > M_PI){
     det_yaw -= 2.0*M_PI;
@@ -249,7 +250,6 @@ double correct_yaw(const geometry_msgs::Quaternion det_quat, double trk_yaw){
   else if (diff_small_2 < (-1)*M_PI){
     det_yaw += 2.0*M_PI;
   }
-
   return det_yaw;
 }
 
@@ -280,7 +280,7 @@ double mahalanobis_distance(track trk, jsk_recognition_msgs::BoundingBox p2){
   det[6] = correct_yaw(p2.pose.orientation, trk.kf.statePre.at<float>(6));
 
   if (debug_){
-    cout <<"After angle correction: " << det[6] - t[6] << endl;
+    cout <<"After angle correction: " << (det[6] - t[6])*180.0/M_PI << endl;
   }
   cv::Mat tk = cv::Mat(measDim, 1, CV_32F, t);
   cv::Mat d = cv::Mat(measDim, 1, CV_32F, det);
@@ -528,13 +528,20 @@ void get_detection(const argo_detection::DetectionArray detections, tf::StampedT
     jsk_bboxs.push_back(bbox);
     // bbox.label = ; uint32
 
-    jsk_recognition_msgs::BoundingBoxArray jsk_bboxs_array;
-    for (int i=0; i<jsk_bboxs.size(); i++){
-      jsk_bboxs_array.header = jsk_bboxs.at(i).header;
-      jsk_bboxs_array.boxes.push_back(jsk_bboxs.at(i));
-    }
-    pub_jsk_bbox.publish(jsk_bboxs_array);
+    // jsk_recognition_msgs::BoundingBoxArray jsk_bboxs_array;
+    // for (int i=0; i<jsk_bboxs.size(); i++){
+    //   jsk_bboxs_array.header = jsk_bboxs.at(i).header;
+    //   jsk_bboxs_array.boxes.push_back(jsk_bboxs.at(i));
+    // }
+    // pub_jsk_bbox.publish(jsk_bboxs_array);
   }
+  cout <<"We get " << jsk_bboxs.size() << " detections."<<endl;
+  jsk_recognition_msgs::BoundingBoxArray jsk_bboxs_array;
+  for (int i=0; i<jsk_bboxs.size(); i++){
+    jsk_bboxs_array.header = jsk_bboxs.at(i).header;
+    jsk_bboxs_array.boxes.push_back(jsk_bboxs.at(i));
+  }
+  pub_jsk_bbox.publish(jsk_bboxs_array);
 
   return;
 }
@@ -903,7 +910,7 @@ void show_trajectory(){
     }
   }
 
-  cout<<"We have "<<tra_array.markers.size()<< " moving objects."<<endl;
+  // cout<<"We have "<<tra_array.markers.size()<< " moving objects."<<endl;
 
   pub_tra.publish(tra_array);
   pub_pt.publish(point_array);
@@ -1179,26 +1186,36 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
     //-1 for non matched tracks, gating function : use velocity to filter out impossible matching
     if ( assignment[k] != -1 ){
       int clus_idx = assignment[k];
-      if (fabs( jsk_bboxs.at(clus_idx).pose.position.x - current_track->history.back().x ) < fabs(current_track->pred_v.x) * dt + bias && \
-          fabs( jsk_bboxs.at(clus_idx).pose.position.y - current_track->history.back().y ) < fabs(current_track->pred_v.y) * dt + bias){
-        
+
+      if ( motion_flag_ ){
+        if (fabs( jsk_bboxs.at(clus_idx).pose.position.x - current_track->history.back().x ) < fabs(current_track->pred_v.x) * dt + bias && \
+            fabs( jsk_bboxs.at(clus_idx).pose.position.y - current_track->history.back().y ) < fabs(current_track->pred_v.y) * dt + bias){
+          
+          obj_id.at(clus_idx) = current_track->uuid;
+          current_track->cluster_idx = clus_idx;
+          current_track->state = "tracking";
+          // if (debug_){
+            cout << "The track " << current_track->uuid << " dist is " << distMat[k][clus_idx] << endl;
+          // }
+        }
+        else{
+          // if(debug_){
+            cout << "FILTERED OUT！！" << " The track " << current_track->uuid << " dist is " << distMat[k][clus_idx] << endl;
+          // }
+          current_track->state = "lost";
+        }  
+      }
+      else{
         obj_id.at(clus_idx) = current_track->uuid;
         current_track->cluster_idx = clus_idx;
         current_track->state = "tracking";
-        // if (debug_){
-          cout << "The track " << current_track->uuid << " dist is " << distMat[k][clus_idx] << endl;
-      //   }
+        cout << "The track " << current_track->uuid << " dist is " << distMat[k][clus_idx] << endl;
       }
-      else{
-        // if(debug_){
-          cout << "FILTERED OUT！！" << " The track " << current_track->uuid << " dist is " << distMat[k][clus_idx] << endl;
-        // }
-        current_track->state = "lost";
-      }  
     }
     else // tracks missed(not correspondance build)
     {
       current_track->state= "lost";
+      cout << "The track " << current_track->uuid << " is lost due to not matched." << endl;
     }
     
 
@@ -1660,6 +1677,7 @@ int main(int argc, char** argv){
   nh.param<bool>("global_frame", global_frame_, true);
   nh.param<bool>("use_detection", use_detection_, true);
   nh.param<bool>("debug", debug_, false);
+  nh.param<bool>("motion_filter", motion_flag_, false);
 
   //用nh.param("globel", global, defaultvalue);
   //在callback裡面取得msg.header.frame_id當成inputid, 這個FRAME為outputid, 用這個方式轉transform
@@ -1701,6 +1719,7 @@ int main(int argc, char** argv){
 
   ROS_INFO("We now at %s frame", FRAME.c_str());
   ROS_INFO("Using detection : %s", (use_detection_ ? "true" : "false") );
+  ROS_INFO("Using motion filter: %s", (motion_flag_? "true" : "false") );
 
  
   
