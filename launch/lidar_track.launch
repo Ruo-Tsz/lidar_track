@@ -6,6 +6,7 @@
         <param name="use_detection"     value="true"/>
         <param name="debug"             value="false"/>
         <param name="motion_filter"     value="false"/>
+        <param name="da_method"         value="g"/>
     </node>
 </launch>
 

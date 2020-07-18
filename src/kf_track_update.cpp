@@ -209,7 +209,7 @@ typedef struct track{
 std::vector<track> filters;
 ros::Time label_timestamp;
 
-string dataset_,topic;
+string dataset_, da_method_, topic;
 bool global_frame_, use_detection_, output_, debug_, motion_flag_;
 
 
@@ -251,6 +251,76 @@ double correct_yaw(const geometry_msgs::Quaternion det_quat, double trk_yaw){
     det_yaw += 2.0*M_PI;
   }
   return det_yaw;
+}
+
+
+bool comparator ( const pair<double, int>& l, const pair<double, int>& r){ 
+  return l.first < r.first; 
+}
+
+vector<int> greedy_search(const std::vector<std::vector<double>> numbers){
+  // sort by asscending order
+  int trk_num = numbers.size();
+  int det_num = numbers.at(0).size();
+  /*
+  // double arr2d[trk_num][det_num];
+  // for (int i=0; i<numbers.size(); i++){
+  //   for (int j=0; j<numbers[0].size(); j++){
+  //     arr2d[i][j] = numbers.at(i).at(j);
+  //   }
+  // }
+  // std::sort(&arr2d[0][0], &arr2d[0][0] + trk_num*det_num, std::less<double>());
+  
+  // std::vector<double> v(&arr2d, &(arr2d + trk_num*det_num));
+  // // for(int i=0; i<trk_num; i++){
+  // //   for(int j=0; j<det_num; j++)
+  // //     cout << arr2d[i][j] << " ";
+  // // }
+  // // cout <<endl;
+  // // exit(-1);
+  */
+  std::vector<pair<double, int>> whole_value;
+  std::vector<pair<int, int>> whole_idx;
+  int count=0;
+  for(int i=0; i<trk_num; i++){
+    for(int j=0; j<det_num; j++){
+      pair<double, int> temp;
+      temp.first = numbers.at(i).at(j);
+      temp.second = count++;
+      whole_value.push_back(temp);
+
+      pair<int, int>idx;
+      idx.first = i;
+      idx.second = j;
+      whole_idx.push_back(idx);
+    }
+  }
+
+  sort(whole_value.begin(), whole_value.end(), comparator);
+  // for(int i=0; i<trk_num*det_num; i++)
+  //   cout << "<" << whole_value.at(i).first << "," <<whole_value.at(i).second << ">" << " ";
+  
+  int loc = whole_value.at(0).second;
+  // cout << whole_idx.at(loc).first << "," << whole_idx.at(loc).second << endl;
+  // cout << numbers.at(whole_idx.at(loc).first).at(whole_idx.at(loc).second) << endl; 
+  // exit(-1);
+
+  //loc.first = trk_index, loc.second = det_index;
+  vector<int> assignment(trk_num, -1);
+  vector<bool> trk_matched(trk_num, false);
+  vector<bool> det_matched(det_num, false);
+
+  for(int i=0; i<trk_num*det_num; i++){
+    double value = whole_value.at(i).first;
+    pair<int, int> loc = whole_idx.at(whole_value.at(i).second);
+    if ( !(trk_matched.at(loc.first)) && !(det_matched.at(loc.second)) ){
+      assignment[loc.first] = loc.second;
+      trk_matched.at(loc.first) = true;
+      det_matched.at(loc.second) = true;
+    }
+  }
+
+  return assignment;
 }
 
 
@@ -527,14 +597,8 @@ void get_detection(const argo_detection::DetectionArray detections, tf::StampedT
     // bbox.pose.orientation.w = objects.points.at(i).rotation.w;
     jsk_bboxs.push_back(bbox);
     // bbox.label = ; uint32
-
-    // jsk_recognition_msgs::BoundingBoxArray jsk_bboxs_array;
-    // for (int i=0; i<jsk_bboxs.size(); i++){
-    //   jsk_bboxs_array.header = jsk_bboxs.at(i).header;
-    //   jsk_bboxs_array.boxes.push_back(jsk_bboxs.at(i));
-    // }
-    // pub_jsk_bbox.publish(jsk_bboxs_array);
   }
+
   cout <<"We get " << jsk_bboxs.size() << " detections."<<endl;
   jsk_recognition_msgs::BoundingBoxArray jsk_bboxs_array;
   for (int i=0; i<jsk_bboxs.size(); i++){
@@ -1161,17 +1225,21 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
   
   
   //-----------------
-  
-  // ///////////////////original whole Hungarian
-  // hungarian method to optimize(minimize) the dist matrix
-  HungarianAlgorithm HungAlgo;
   vector<int> assignment;
+  if ( da_method_ == "g"){ 
+    assignment = greedy_search(distMat);
+    for(int x=0; x<distMat.size(); x++)
+      std::cout << x << "," << assignment[x] << "\t";
+    cout<<endl;
+  }
+  else{   
+    HungarianAlgorithm HungAlgo;
+    double cost = HungAlgo.Solve(distMat, assignment);
 
-  double cost = HungAlgo.Solve(distMat, assignment);
-
-  // for (unsigned int x = 0; x < distMat.size(); x++)
-  //   std::cout << x << "," << assignment[x] << "\t";
-  // std::cout << "\ncost: " << cost << std::endl;
+    // for (unsigned int x = 0; x < distMat.size(); x++)
+    //   std::cout << x << "," << assignment[x] << "\t";
+    // std::cout << "\ncost: " << cost << std::endl;
+  }
 
 
   std::vector<int> obj_id(jsk_bboxs.size(),-1); 
@@ -1475,31 +1543,6 @@ void callback(const sensor_msgs::PointCloud2ConstPtr& cloud, const argo_detectio
   cout<<"Detection stamp " << det_timestamp << endl;
 
 
-
-  // 原本的get  會產生lidar永遠比lable快0.1秒（1禎）,一直lose, tracking糟
-  // 最原始sync_time = 0.2 => 非常即時的shift一個frame()
-  // if ( !get_label ){
-  //     cout<<"Not detect. @"<<lidar_timestamp<<endl;
-  //     return;
-  // }
-  // // For gt_label 先關掉 直接label來就做
-  // else{
-  //     time_dif = lidar_timestamp.toSec() - label_timestamp.toSec();
-  //     if (fabs(time_dif) >= sync_time){
-  //         cout<<"Not detect. @ lidar: "<<lidar_timestamp<<", label: "<<label_timestamp<<endl;
-  //         cout<<"Lidar to sec " << lidar_timestamp.sec << ", "<<label_timestamp.nsec<<endl;
-  //         long double time = ( lidar_timestamp.sec%10000 + lidar_timestamp.nsec/1000000000.0 )*10.0 ;
-  //         // long double time =  (lidar_timestamp.nsec/100000000.0) + lidar_timestamp.sec * 10;
-  //         cout<<fixed<<setprecision(9)<<time<< endl;
-  //         long int shift = time ;
-  //         cout<< shift << endl;
-  //         // cout<< ((lidar_timestamp.nsec) / 1000000000.0) << endl;
-  //         // cout<< ( label_timstamp * 10 )%1 << endl;
-  //         return;
-  //     }
-  // }
-
-
   sensor_msgs::PointCloud2 out;
   sensor_msgs::PointCloud out_2,out_transformed_2;
   out = msg;
@@ -1512,7 +1555,7 @@ void callback(const sensor_msgs::PointCloud2ConstPtr& cloud, const argo_detectio
         // tf_listener->waitForTransform("/map", "/scan", ros::Time(0), ros::Duration(5.0));
         tf_listener->waitForTransform("/map", topic, lidar_timestamp, ros::Duration(1.0));
         tf_listener->lookupTransform("/map", topic, lidar_timestamp, transform);
-        // pcl_ros::transformPointCloud("/map", *cloud_pcl_whole, *cloud_pcl, (*tf_listener)); //pcl_ros’ has not been declared
+        // pcl_ros::transformPointCloud("/map", *cloud_pcl_whole, *cloud_pcl, (*tf_listener)); //pcl_ros has not been declared
         tf_listener->transformPointCloud("/map", out_2, out_transformed_2);
         // tf_listener->transformPointCloud("/map", )
     }
@@ -1556,29 +1599,6 @@ void callback(const sensor_msgs::PointCloud2ConstPtr& cloud, const argo_detectio
     get_detection(*detection, transform);
   }
 
-  
-  
-  //(1)
-  /////////////////////////////////////////////remove above preprocessing point cloud and from filter_cluster just get bbox to see tracking performance (1)
-  /*
-  cens.clear(); //(2)
-  if ( get_label ){
-    // float time_dif = lidar_timestamp.toSec() - label_timestamp.toSec();
-    if (fabs(time_dif) < sync_time){
-      cout <<" Differ time"<<fabs(time_dif) << endl;
-      // filter_cluster(); //(1)
-      get_bbox(); //(2)
-    }
-    else{
-      cout<<"Not detect. yo\n";
-      return;
-    }
-  }  
-  else{
-    cout<<"Not detect.\n";
-    return;
-  }
-  */
 
   if( firstFrame ){
     int current_id = jsk_bboxs.size();
@@ -1602,15 +1622,6 @@ void callback(const sensor_msgs::PointCloud2ConstPtr& cloud, const argo_detectio
   KFT(det_timestamp, true);
   draw_box(*detection);
                  
-  /* (1)
-  cloud_clusters = crop(cloud_clusters);
-  sensor_msgs::PointCloud2 cluster_cloud;
-  pcl::toROSMsg(*cloud_clusters, cluster_cloud);
-//   cluster_cloud.header.frame_id = "/nuscenes_lidar";
-  cluster_cloud.header.frame_id = "/scan";
-  cluster_pub.publish(cluster_cloud);
-  */ 
-
   return;
 
 }
@@ -1678,6 +1689,7 @@ int main(int argc, char** argv){
   nh.param<bool>("use_detection", use_detection_, true);
   nh.param<bool>("debug", debug_, false);
   nh.param<bool>("motion_filter", motion_flag_, false);
+  nh.param<string>("da_method", da_method_, "h");
 
   //用nh.param("globel", global, defaultvalue);
   //在callback裡面取得msg.header.frame_id當成inputid, 這個FRAME為outputid, 用這個方式轉transform
@@ -1720,6 +1732,7 @@ int main(int argc, char** argv){
   ROS_INFO("We now at %s frame", FRAME.c_str());
   ROS_INFO("Using detection : %s", (use_detection_ ? "true" : "false") );
   ROS_INFO("Using motion filter: %s", (motion_flag_? "true" : "false") );
+  ROS_INFO("Using %s", ((da_method_ == "g")? "greedy" : "hungarian") );
 
  
   
