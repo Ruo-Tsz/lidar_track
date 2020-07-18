@@ -4,6 +4,8 @@
         <param name="output"            value="false"/>
         <param name="global_frmae"      value="true"/>
         <param name="use_detection"     value="true"/>
+        <param name="debug"             value="false"/>
+        <param name="motion_filter"     value="false"/>
     </node>
 </launch>
 
