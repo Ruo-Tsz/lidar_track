@@ -124,6 +124,8 @@
 #include <message_filters/sync_policies/approximate_time.h>
 #include <boost/bind.hpp>
 
+#include <opencv2/core/types.hpp>
+
 ofstream outputFile;
 
 typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::PointCloud2,
@@ -148,6 +150,7 @@ image_transport::Publisher img_pub;
 
 // tf::TransformListener listener;//declare in global would act like initialing a handler, it then before ros::init() and cause error 
 tf::TransformListener *tf_listener; //Use a pointer to initialize in main instead
+tf::StampedTransform toGlobal_transform;
 
 pcl::PointCloud<PointT>::Ptr cloud_pcl(new pcl::PointCloud<PointT>);
 pcl::PointCloud<PointT>::Ptr cloud_pcl_whole(new pcl::PointCloud<PointT>);
@@ -157,6 +160,7 @@ pcl::PointCloud<PointT>::Ptr cloud_filtered(new pcl::PointCloud<PointT>);
 
 vector<PointT> cens, cens_all;
 vector<jsk_recognition_msgs::BoundingBox> jsk_bboxs;
+std::vector<std::vector<cv::Point3f>> det_corners;
 visualization_msgs::MarkerArray m_s,l_s,current_m_a, tra_array, point_array, v_array, pred_point_array, self_v_array;
 visualization_msgs::MarkerArray detection_array;
 int max_size = 0;
@@ -210,7 +214,7 @@ std::vector<track> filters;
 ros::Time label_timestamp;
 
 string dataset_, da_method_, topic;
-bool global_frame_, use_detection_, output_, debug_, motion_flag_;
+bool global_frame_, use_detection_, output_, debug_, motion_flag_, use_iou_;
 
 
 double get_yaw(const geometry_msgs::Quaternion quat){
@@ -259,26 +263,9 @@ bool comparator ( const pair<double, int>& l, const pair<double, int>& r){
 }
 
 vector<int> greedy_search(const std::vector<std::vector<double>> numbers){
-  // sort by asscending order
   int trk_num = numbers.size();
   int det_num = numbers.at(0).size();
-  /*
-  // double arr2d[trk_num][det_num];
-  // for (int i=0; i<numbers.size(); i++){
-  //   for (int j=0; j<numbers[0].size(); j++){
-  //     arr2d[i][j] = numbers.at(i).at(j);
-  //   }
-  // }
-  // std::sort(&arr2d[0][0], &arr2d[0][0] + trk_num*det_num, std::less<double>());
-  
-  // std::vector<double> v(&arr2d, &(arr2d + trk_num*det_num));
-  // // for(int i=0; i<trk_num; i++){
-  // //   for(int j=0; j<det_num; j++)
-  // //     cout << arr2d[i][j] << " ";
-  // // }
-  // // cout <<endl;
-  // // exit(-1);
-  */
+
   std::vector<pair<double, int>> whole_value;
   std::vector<pair<int, int>> whole_idx;
   int count=0;
@@ -296,6 +283,7 @@ vector<int> greedy_search(const std::vector<std::vector<double>> numbers){
     }
   }
 
+  // sort whole value in asscending order
   sort(whole_value.begin(), whole_value.end(), comparator);
   // for(int i=0; i<trk_num*det_num; i++)
   //   cout << "<" << whole_value.at(i).first << "," <<whole_value.at(i).second << ">" << " ";
@@ -312,7 +300,8 @@ vector<int> greedy_search(const std::vector<std::vector<double>> numbers){
 
   for(int i=0; i<trk_num*det_num; i++){
     double value = whole_value.at(i).first;
-    pair<int, int> loc = whole_idx.at(whole_value.at(i).second);
+    // loc means index pair <trk_idx, det_idx>
+     pair<int, int> loc = whole_idx.at(whole_value.at(i).second);
     if ( !(trk_matched.at(loc.first)) && !(det_matched.at(loc.second)) ){
       assignment[loc.first] = loc.second;
       trk_matched.at(loc.first) = true;
@@ -321,6 +310,49 @@ vector<int> greedy_search(const std::vector<std::vector<double>> numbers){
   }
 
   return assignment;
+}
+
+
+
+void get_3d_corners(const geometry_msgs::Vector3 one_box, const tf::Transform transform_global, \
+                    std::vector<cv::Point3f> &corners){
+    /*
+    Args:
+        None
+    Returns:
+        Numpy array of shape (8,3)
+    Corner numbering::
+          5------4
+          |\\    |\\
+          | \\   | \\
+          6--\\--7  \\
+          \\  \\  \\ \\
+      l    \\  1-------0    h
+      e    \\ ||   \\ ||   e
+        n    \\||    \\||   i
+        g    \\2------3    g
+          t      width.     h
+          h.               t.
+    First four corners are the ones facing forward.
+    The last four are the ones facing backwards.
+    */
+
+
+    Eigen::MatrixXf cor_local(3, 8);
+    // get bird eye view bbox (0~3 is top rectangle -> 0.1.5.4.3.2.6.7)
+    cor_local << 1, 1, -1, -1, 1, 1, -1, -1,
+                 1, -1, -1, 1, 1, -1, -1, 1,
+                 1, 1, 1, 1, -1, -1, -1, -1; 
+    cor_local.row(0) *= one_box.x/2; // length
+    cor_local.row(1) *= one_box.y/2; // width
+    cor_local.row(2) *= one_box.z/2; // height
+
+    for(int i=0; i<cor_local.cols(); i++){
+        tf::Point pt(cor_local(0, i), cor_local(1, i), cor_local(2, i));
+        tf::Point ptTransform = transform_global * pt;
+        corners.push_back( cv::Point3f(ptTransform.x(), ptTransform.y(), ptTransform.z()) );
+    }
+    return;
 }
 
 
@@ -361,6 +393,323 @@ double mahalanobis_distance(track trk, jsk_recognition_msgs::BoundingBox p2){
   // cout << "The tracker " << trk.uuid << ", state " << std::setw(8) << trk.state << ", S_inv: " << S_inv.at<float>(0,0) <<", lose frame: "<<trk.lose_frame<< endl;
   double m_dist = cv::Mahalanobis(tk, d, S_inv);
   return sqrt( m_dist );
+}
+
+
+
+// reproduce cv::RotatedRect
+cv::RotatedRect RotatedRect_2d(const cv::Point2d &_point1, const cv::Point2d &_point2, const cv::Point2d &_point3)
+{
+    cv::Point2d _center = 0.5f * (_point1 + _point3);
+    cv::Vec2d vecs[2];
+    vecs[0] = cv::Vec2d(_point1 - _point2);
+    vecs[1] = cv::Vec2d(_point2 - _point3);
+    // // print
+    // print_point(_point1);
+    // print_point(_point2);
+    // print_point(_point3);
+    // std::cout << cv::norm(vecs[0]) << std::endl;
+    // std::cout << cv::norm(vecs[1]) << std::endl;
+    // std::cout << abs(vecs[0].dot(vecs[1])) / (cv::norm(vecs[0]) * cv::norm(vecs[1])) << std::endl;
+    // check that given sides are perpendicular
+
+    // original cv::RotatedRect assertation, would abort
+    // CV_Assert(abs(vecs[0].dot(vecs[1])) / (cv::norm(vecs[0]) * cv::norm(vecs[1])) <= FLT_EPSILON);
+    // change to : 
+    CV_Assert(std::fabs(vecs[0].ddot(vecs[1])) <=
+          0.017 /*cos(89deg)*/ * cv::norm(vecs[0]) * cv::norm(vecs[1]));
+
+    // wd_i stores which vector (0,1) or (1,2) will make the width
+    // One of them will definitely have slope within -1 to 1
+    int wd_i = 0;
+    if (std::abs(vecs[1][1]) < std::abs(vecs[1][0]))
+        wd_i = 1;
+    int ht_i = (wd_i + 1) % 2;
+
+    double _angle = std::atan(vecs[wd_i][1] / vecs[wd_i][0]) * 180.0f / (double)CV_PI;
+    double _width = (double)cv::norm(vecs[wd_i]);
+    double _height = (double)cv::norm(vecs[ht_i]);
+
+    return cv::RotatedRect(_center, cv::Size2d(_width, _height), _angle);
+}
+
+
+// reproduce cv::rotatedRectangleIntersection
+int rotatedRectangleIntersection_2d( const RotatedRect& rect1, const RotatedRect& rect2, OutputArray intersectingRegion )
+{
+    // CV_INSTRUMENT_REGION()
+
+    const float samePointEps = 0.00001f; // used to test if two points are the same
+
+    Point2f vec1[4], vec2[4];
+    Point2f pts1[4], pts2[4];
+
+    std::vector <Point2f> intersection;
+
+    rect1.points(pts1);
+    rect2.points(pts2);
+
+    int ret = INTERSECT_FULL;
+
+    // Specical case of rect1 == rect2
+    {
+        bool same = true;
+
+        for( int i = 0; i < 4; i++ )
+        {
+            if( fabs(pts1[i].x - pts2[i].x) > samePointEps || (fabs(pts1[i].y - pts2[i].y) > samePointEps) )
+            {
+                same = false;
+                break;
+            }
+        }
+
+        if(same)
+        {
+            intersection.resize(4);
+
+            for( int i = 0; i < 4; i++ )
+            {
+                intersection[i] = pts1[i];
+            }
+
+            Mat(intersection).copyTo(intersectingRegion);
+
+            return INTERSECT_FULL;
+        }
+    }
+
+    // Line vector
+    // A line from p1 to p2 is: p1 + (p2-p1)*t, t=[0,1]
+    for( int i = 0; i < 4; i++ )
+    {
+        vec1[i].x = pts1[(i+1)%4].x - pts1[i].x;
+        vec1[i].y = pts1[(i+1)%4].y - pts1[i].y;
+
+        vec2[i].x = pts2[(i+1)%4].x - pts2[i].x;
+        vec2[i].y = pts2[(i+1)%4].y - pts2[i].y;
+    }
+
+    // Line test - test all line combos for intersection
+    for( int i = 0; i < 4; i++ )
+    {
+        for( int j = 0; j < 4; j++ )
+        {
+            // Solve for 2x2 Ax=b
+            float x21 = pts2[j].x - pts1[i].x;
+            float y21 = pts2[j].y - pts1[i].y;
+
+            float vx1 = vec1[i].x;
+            float vy1 = vec1[i].y;
+
+            float vx2 = vec2[j].x;
+            float vy2 = vec2[j].y;
+
+            float det = vx2*vy1 - vx1*vy2;
+
+            float t1 = (vx2*y21 - vy2*x21) / det;
+            float t2 = (vx1*y21 - vy1*x21) / det;
+
+            // This takes care of parallel lines
+            if( cvIsInf(t1) || cvIsInf(t2) || cvIsNaN(t1) || cvIsNaN(t2) )
+            {
+                continue;
+            }
+
+            if( t1 >= 0.0f && t1 <= 1.0f && t2 >= 0.0f && t2 <= 1.0f )
+            {
+                float xi = pts1[i].x + vec1[i].x*t1;
+                float yi = pts1[i].y + vec1[i].y*t1;
+
+                intersection.push_back(Point2f(xi,yi));
+            }
+        }
+    }
+
+    if( !intersection.empty() )
+    {
+        ret = INTERSECT_PARTIAL;
+    }
+
+    // Check for vertices from rect1 inside recct2
+    for( int i = 0; i < 4; i++ )
+    {
+        // We do a sign test to see which side the point lies.
+        // If the point all lie on the same sign for all 4 sides of the rect,
+        // then there's an intersection
+        int posSign = 0;
+        int negSign = 0;
+
+        float x = pts1[i].x;
+        float y = pts1[i].y;
+
+        for( int j = 0; j < 4; j++ )
+        {
+            // line equation: Ax + By + C = 0
+            // see which side of the line this point is at
+            // from float to double
+            double A = -vec2[j].y;
+            double B = vec2[j].x;
+            double C = -(A*pts2[j].x + B*pts2[j].y);
+
+            double s = A*x+ B*y+ C;
+
+            if( s >= 0 )
+            {
+                posSign++;
+            }
+            else
+            {
+                negSign++;
+            }
+        }
+
+        if( posSign == 4 || negSign == 4 )
+        {
+            intersection.push_back(pts1[i]);
+        }
+    }
+
+    // Reverse the check - check for vertices from rect2 inside recct1
+    for( int i = 0; i < 4; i++ )
+    {
+        // We do a sign test to see which side the point lies.
+        // If the point all lie on the same sign for all 4 sides of the rect,
+        // then there's an intersection
+        int posSign = 0;
+        int negSign = 0;
+
+        float x = pts2[i].x;
+        float y = pts2[i].y;
+
+        for( int j = 0; j < 4; j++ )
+        {
+            // line equation: Ax + By + C = 0
+            // see which side of the line this point is at
+            // from float to double
+            double A = -vec1[j].y;
+            double B = vec1[j].x;
+            double C = -(A*pts1[j].x + B*pts1[j].y);
+
+            double s = A*x + B*y + C;
+
+            if( s >= 0 )
+            {
+                posSign++;
+            }
+            else
+            {
+                negSign++;
+            }
+        }
+
+        if( posSign == 4 || negSign == 4 )
+        {
+            intersection.push_back(pts2[i]);
+        }
+    }
+
+    // Get rid of dupes and order points.
+    for( int i = 0; i < (int)intersection.size()-1; i++ )
+    {
+        float dx1 = intersection[i + 1].x - intersection[i].x;
+        float dy1 = intersection[i + 1].y - intersection[i].y;
+        for( size_t j = i+1; j < intersection.size(); j++ )
+        {
+            float dx = intersection[j].x - intersection[i].x;
+            float dy = intersection[j].y - intersection[i].y;
+            double d2 = dx*dx + dy*dy; // can be a really small number, need double here
+
+            if( d2 < samePointEps*samePointEps )
+            {
+                // Found a dupe, remove it
+                std::swap(intersection[j], intersection.back());
+                intersection.pop_back();
+                j--; // restart check
+            }
+            else if (dx1 * dy - dy1 * dx < 0)
+            {
+                std::swap(intersection[i + 1], intersection[j]);
+                dx1 = dx;
+                dy1 = dy;
+            }
+        }
+    }
+
+    if( intersection.empty() )
+    {
+        return INTERSECT_NONE ;
+    }
+
+    // If this check fails then it means we're getting dupes, increase samePointEps
+    CV_Assert( intersection.size() <= 8 );
+
+    Mat(intersection).copyTo(intersectingRegion);
+
+    return ret;
+}
+
+
+double iou_distance(track trk, std::vector<cv::Point3f> det_corner){
+  geometry_msgs::Vector3 dim;
+  dim.x = trk.kf.statePre.at<float>(3);
+  dim.y = trk.kf.statePre.at<float>(4);
+  dim.z = trk.kf.statePre.at<float>(5);
+  std::vector<cv::Point3f> trk_corner;
+  
+  // trk Mx7 state, in global coordinate
+  // get 8 corners for trk, need each transform from local to global
+  tf::Transform trk_global_pose;
+  trk_global_pose.setOrigin( tf::Vector3(trk.pred_pose.x, trk.pred_pose.y, trk.pred_pose.z) );
+  trk_global_pose.setRotation( tf::createQuaternionFromYaw(trk.kf.statePre.at<float>(6)) );
+
+  get_3d_corners(dim, trk_global_pose, trk_corner);
+  // for (int i=0; i<trk_corner.size(); i++){
+  //   cout << "trk_corners[0] is " << trk_corner.at(i).x << ", " << trk_corner.at(i).y << ", "<< trk_corner.at(i).z << endl;
+  // }
+
+  // calculate iou btw det_corner and trk_corner, BEV rectangle (0~3 pts)
+  std::vector<cv::Point2d> det_Rotated_pts, trk_Rotated_pts;
+  for(int i=0; i<3; i++){
+    det_Rotated_pts.push_back(cv::Point2f(det_corner.at(i).x, det_corner.at(i).y));
+    trk_Rotated_pts.push_back(cv::Point2f(trk_corner.at(i).x, trk_corner.at(i).y));
+  }
+
+  cv::RotatedRect det_rect, trk_rect;
+
+  det_rect = RotatedRect_2d(det_Rotated_pts.at(0), det_Rotated_pts.at(1), det_Rotated_pts.at(2));
+  trk_rect = RotatedRect_2d(trk_Rotated_pts.at(0), trk_Rotated_pts.at(1), trk_Rotated_pts.at(2));
+  // cv::RotatedRect would cause CV_Assert and abort, so reproduce/duplicate code to RotatedRect_2d and change
+  // try{
+  //   det_rect = cv::RotatedRect(det_Rotated_pts.at(0), det_Rotated_pts.at(1), det_Rotated_pts.at(2));
+  //   trk_rect = cv::RotatedRect(trk_Rotated_pts.at(0), trk_Rotated_pts.at(1), trk_Rotated_pts.at(2));
+  // }
+  // catch (const cv::Exception& e){
+  //   CV_Assert((std::fabs(vecs[0].ddot(vecs[1])) <= FLT_EPSILON * (cv::norm(vecs[0]) * cv::norm(vecs[1]))) || (std::fabs(vecs[0].ddot(vecs[0]) + vecs[1].ddot(vecs[1]) - vec2.ddot(vec2)) <= FLT_EPSILON * vec2.ddot(vec2)));
+  //   cout << e.what();
+  //   return 0.0;
+  // }
+
+  float areaRect1 = det_rect.size.width * det_rect.size.height;
+  float areaRect2 = trk_rect.size.width * trk_rect.size.height;
+  vector<cv::Point2f> vertices;
+
+  // would fail as CV_Assert( intersection.size() <= 8 ), result from precision problem
+  // int intersectionType = cv::rotatedRectangleIntersection(det_rect, trk_rect, vertices);
+  // Duplicate cv::rotatedRectangleIntersection as rotatedRectangleIntersection_2d and change A.B.C.s from float to double, it solve the problem
+  int intersectionType = rotatedRectangleIntersection_2d(det_rect, trk_rect, vertices);
+  if (vertices.size()==0){
+    return 0.0;
+  }
+  else{
+    vector<cv::Point2f> order_pts;
+    // 找到交集（交集的區域），對輪廓的各個點進行排序
+
+    cv::convexHull(cv::Mat(vertices), order_pts, true);
+    double area = cv::contourArea(order_pts);
+    float inner = (float) (area / (areaRect1 + areaRect2 - area + 0.0001));
+    return inner;
+  }
 }
 
 
@@ -515,37 +864,12 @@ void get_bbox(){
       bbox.z = z_m;
       cens.push_back(bbox);
     
-      
-
-      //transform gt box into map frame to tracking at map frame(motion segmention)
-      // geometry_msgs::PointStamped pt;
-      // geometry_msgs::PointStamped pt_transformed;
-      // pt.header = current_m_a.markers[0].header;
-      // pt.point.x = x_m;
-      // pt.point.y = y_m;
-      // pt.point.z = z_m;
-      
-      // try{
-      //     tf_listener->waitForTransform("/map","/scan",ros::Time(0),ros::Duration(5.0));//blocked process till get transform or 5 sec
-      //     tf_listener->transformPoint("/map", pt, pt_transformed);
-      // }
-      // catch(tf::TransformException &ex) {
-      //     ROS_WARN("%s", ex.what());
-      //     // ros::Duration(1.0).sleep();
-      //     continue;
-
-      // }
-      // // using point/coordinate in map frame to tracking
-      // PointT bbox;
-      // bbox.x = pt_transformed.point.x;
-      // bbox.y = pt_transformed.point.y;
-      // bbox.z = pt_transformed.point.z;
-      // cens.push_back(bbox);
     }
-
 
   }
 }
+
+
 
 void get_detection(const argo_detection::DetectionArray detections, tf::StampedTransform transform){
   argo_detection::DetectionArray objects = detections;
@@ -590,14 +914,23 @@ void get_detection(const argo_detection::DetectionArray detections, tf::StampedT
     bbox.dimensions.y = objects.points.at(i).width;
     bbox.dimensions.z = objects.points.at(i).height;
 
-    // !!!! quaternion也要轉
-    // bbox.pose.orientation.x = objects.points.at(i).rotation.x;
-    // bbox.pose.orientation.y = objects.points.at(i).rotation.y;
-    // bbox.pose.orientation.z = objects.points.at(i).rotation.z;
-    // bbox.pose.orientation.w = objects.points.at(i).rotation.w;
+
     jsk_bboxs.push_back(bbox);
     // bbox.label = ; uint32
+
+
+    // get 8 corner pts in global
+    std::vector<cv::Point3f> corners;
+    tf::Transform g_transform = transform * pose_local;
+    // get_3d_corners(objects.points.at(i), g_transform, corners);
+    get_3d_corners(bbox.dimensions, g_transform, corners);
+    det_corners.push_back(corners);
   }
+
+  // for (int i=0; i<det_corners.at(0).size(); i++){
+  //   cout << "corners[0] is " << det_corners.at(0).at(i).x << ", " << det_corners.at(0).at(i).y << ", "<< det_corners.at(0).at(i).z << endl;
+  // }
+  // cout<< "det_corners size: " << det_corners.size() << endl;
 
   cout <<"We get " << jsk_bboxs.size() << " detections."<<endl;
   jsk_recognition_msgs::BoundingBoxArray jsk_bboxs_array;
@@ -860,7 +1193,7 @@ void show_id(vector<int>obj_id){
       marker.id = k;
       marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
 
-      marker.scale.z = 1.5f;
+      marker.scale.z = 1.0f;
       marker.color.b = 0.0f;//yellow
       marker.color.g = 0.9f;
       marker.color.r = 0.9f;
@@ -1116,16 +1449,26 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
         }
       }
       else{
-        cv::KalmanFilter k = (*it).kf;
-        cv::Mat S = (k.measurementMatrix * k.errorCovPre) * k.measurementMatrix.t() + k.measurementNoiseCov;
-        cv::Mat S_inv = S.inv();
-        if( debug_ ){
-          cout << "The tracker " << std::setw(3) << (*it).uuid << ", state " << std::setw(8) << (*it).state << ", S_inv: " << std::fixed << std::setprecision(5) << S_inv.at<float>(0,0) <<", lose frame: "<<(*it).lose_frame<< endl;
+        // using 2d_iou
+        if (use_iou_){
+          for(int n=0; n<jsk_bboxs.size(); n++){
+            distVec.push_back( (-1)*iou_distance((*it), det_corners.at(n)) );
+          }
+
         }
-        for(int n=0;n<jsk_bboxs.size();n++)
-        {
-          // distVec.push_back( mahalanobis_distance( (*it), clusterCenters[n] ));
-          distVec.push_back( mahalanobis_distance( (*it), jsk_bboxs.at(n) ));
+        // using maha
+        else{
+          cv::KalmanFilter k = (*it).kf;
+          cv::Mat S = (k.measurementMatrix * k.errorCovPre) * k.measurementMatrix.t() + k.measurementNoiseCov;
+          cv::Mat S_inv = S.inv();
+          if( debug_ ){
+            cout << "The tracker " << std::setw(3) << (*it).uuid << ", state " << std::setw(8) << (*it).state << ", S_inv: " << std::fixed << std::setprecision(5) << S_inv.at<float>(0,0) <<", lose frame: "<<(*it).lose_frame<< endl;
+          }
+          for(int n=0;n<jsk_bboxs.size();n++)
+          {
+            // distVec.push_back( mahalanobis_distance( (*it), clusterCenters[n] ));
+            distVec.push_back( mahalanobis_distance( (*it), jsk_bboxs.at(n) ));
+          } 
         }
       }
       
@@ -1451,7 +1794,7 @@ void draw_box(const argo_detection::DetectionArray& detection){
     marker.header.stamp = detection.header.stamp;
     marker.ns = "detection_marker";
     marker.action = visualization_msgs::Marker::ADD;
-    marker.lifetime = ros::Duration(dt);
+    marker.lifetime = ros::Duration(0.5);
     marker.type = visualization_msgs::Marker::CUBE;
     marker.id = i;
 
@@ -1548,13 +1891,13 @@ void callback(const sensor_msgs::PointCloud2ConstPtr& cloud, const argo_detectio
   out = msg;
 
   //transform point cloud to map frame by tf
-  tf::StampedTransform transform;
+  // tf::StampedTransform transform;
   if ( global_frame_ ){
     sensor_msgs::convertPointCloud2ToPointCloud(out, out_2);
     try {
         // tf_listener->waitForTransform("/map", "/scan", ros::Time(0), ros::Duration(5.0));
         tf_listener->waitForTransform("/map", topic, lidar_timestamp, ros::Duration(1.0));
-        tf_listener->lookupTransform("/map", topic, lidar_timestamp, transform);
+        tf_listener->lookupTransform("/map", topic, lidar_timestamp, toGlobal_transform);
         // pcl_ros::transformPointCloud("/map", *cloud_pcl_whole, *cloud_pcl, (*tf_listener)); //pcl_ros has not been declared
         tf_listener->transformPointCloud("/map", out_2, out_transformed_2);
         // tf_listener->transformPointCloud("/map", )
@@ -1596,7 +1939,8 @@ void callback(const sensor_msgs::PointCloud2ConstPtr& cloud, const argo_detectio
   else{
     cens.clear();
     jsk_bboxs.clear();
-    get_detection(*detection, transform);
+    det_corners.clear();
+    get_detection(*detection, toGlobal_transform);
   }
 
 
@@ -1690,6 +2034,7 @@ int main(int argc, char** argv){
   nh.param<bool>("debug", debug_, false);
   nh.param<bool>("motion_filter", motion_flag_, false);
   nh.param<string>("da_method", da_method_, "h");
+  nh.param<bool>("use_iou", use_iou_, false);
 
   //用nh.param("globel", global, defaultvalue);
   //在callback裡面取得msg.header.frame_id當成inputid, 這個FRAME為outputid, 用這個方式轉transform
@@ -1733,6 +2078,7 @@ int main(int argc, char** argv){
   ROS_INFO("Using detection : %s", (use_detection_ ? "true" : "false") );
   ROS_INFO("Using motion filter: %s", (motion_flag_? "true" : "false") );
   ROS_INFO("Using %s", ((da_method_ == "g")? "greedy" : "hungarian") );
+  ROS_INFO("Using iou: %s", (use_iou_ ? "true" : "false") );
 
  
   
