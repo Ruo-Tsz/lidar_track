@@ -10,6 +10,7 @@ add_compile_options(-std=c++11)
 find_package(catkin REQUIRED
 pcl_ros
 roscpp
+rviz_visual_tools
 sensor_msgs
 std_msgs
 pcl_conversions
@@ -26,6 +27,7 @@ tf2_msgs
 argo_track_msgs
 track_array_msgs
 argo_detection
+
 )
 
 

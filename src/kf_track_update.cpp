@@ -126,6 +126,10 @@
 
 #include <opencv2/core/types.hpp>
 
+#include <rviz_visual_tools/rviz_visual_tools.h>
+
+rviz_visual_tools::RvizVisualToolsPtr visual_tools_;
+
 ofstream outputFile;
 
 typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::PointCloud2,
@@ -141,7 +145,7 @@ string FRAME="/scan";  //output frmae_id
 typedef pcl::PointXYZI PointT;
 ros::Subscriber sub,label_sub;
 ros::Publisher pub,pub_get,pub_colored;
-ros::Publisher pub_voxel,pub_marker,pub_tra,pub_pt,pub_v,pub_pred, pub_self_v, pub_detection, pub_jsk_bbox;
+ros::Publisher pub_voxel,pub_marker,pub_tra,pub_pt,pub_v,pub_pred, pub_self_v, pub_detection, pub_jsk_bbox, pub_det_hollow, pub_label;
 ros::Publisher cluster_pub;
 
 //get.pub image
@@ -162,7 +166,7 @@ vector<PointT> cens, cens_all;
 vector<jsk_recognition_msgs::BoundingBox> jsk_bboxs;
 std::vector<std::vector<cv::Point3f>> det_corners;
 visualization_msgs::MarkerArray m_s,l_s,current_m_a, tra_array, point_array, v_array, pred_point_array, self_v_array;
-visualization_msgs::MarkerArray detection_array;
+visualization_msgs::MarkerArray detection_array, label_array;
 int max_size = 0;
 
 float dt = 0.1f;//0.1f
@@ -176,7 +180,7 @@ int id_count = 0; //the counter to calculate the current occupied track_id
 #define bias 5.0 //5 //2.0
 #define moving 1 //(10hz(0.1s) v>1m/s=60m/min=3.6km/hr = pedestrian)
 #define invalid_v 30 // 108km/hr
-#define show_tra 6
+#define show_tra 10//6
 #define detection_thres 0.3f
 
 bool get_label = false;
@@ -207,7 +211,14 @@ typedef struct track{
   int uuid ;
   vector<geometry_msgs::Point> history;
   vector<float> S;
+  int label;
 }track;
+
+enum LABEL :int{
+  VEHICLE = 0,
+  PEDESTRIAN = 1,
+  UNKNOWN = 2,  
+};
 
 
 std::vector<track> filters;
@@ -215,6 +226,45 @@ ros::Time label_timestamp;
 
 string dataset_, da_method_, topic;
 bool global_frame_, use_detection_, output_, debug_, motion_flag_, use_iou_;
+
+
+void pub_detection_bbox(visualization_msgs::Marker &marker, const jsk_recognition_msgs::BoundingBox jsk_bbox, int idx){
+  marker.header = jsk_bbox.header;
+  marker.ns = "hollow detection";
+  marker.action = visualization_msgs::Marker::ADD;
+  marker.type = visualization_msgs::Marker::LINE_LIST;
+  marker.lifetime = ros::Duration(dt);
+  marker.pose.orientation.w = 1.0;
+  marker.id = idx;
+  marker.scale.x = 0.1f;
+  marker.color.r = 255.0/255.0f;
+  marker.color.g = 180.0/255.0f;
+  marker.color.b = 200.0/255.0f;
+  // marker.color.b = 0.5f;
+  // marker.color.r = 0.7f;
+  marker.color.a = 1;
+
+  // for (int j=0; j<det_corners.at(idx).size(); j++){
+  int Connect_List[] = {0,1,1,2,2,3,3,0,4,5,5,6,6,7,7,4,0,4,1,5,2,6,3,7};
+  for (int j=0; j<24; j+=2){ 
+    geometry_msgs::Point pt;
+    pt.x = det_corners.at(idx).at(Connect_List[j]).x;
+    pt.y = det_corners.at(idx).at(Connect_List[j]).y;
+    pt.z = det_corners.at(idx).at(Connect_List[j]).z;
+    marker.points.push_back(pt);
+
+    pt.x = det_corners.at(idx).at(Connect_List[j+1]).x;
+    pt.y = det_corners.at(idx).at(Connect_List[j+1]).y;
+    pt.z = det_corners.at(idx).at(Connect_List[j+1]).z;
+    marker.points.push_back(pt);
+    // geometry_msgs::Point pt;
+    // pt.x = det_corners.at(idx).at(j%4).x;
+    // pt.y = det_corners.at(idx).at(j%4).y;
+    // pt.z = det_corners.at(idx).at(j%4).z;
+    // marker.points.push_back(pt);
+  }
+  return;
+}
 
 
 double get_yaw(const geometry_msgs::Quaternion quat){
@@ -872,6 +922,7 @@ void get_bbox(){
 
 
 void get_detection(const argo_detection::DetectionArray detections, tf::StampedTransform transform){
+  // visual_tools_.reset(new rviz_visual_tools::RvizVisualTools(FRAME, "/rviz_visual_markers"));
   argo_detection::DetectionArray objects = detections;
   cout << "In get_detection: " << detections.header.stamp << endl;;
   for(int i=0; i<objects.points.size(); i++){
@@ -914,15 +965,21 @@ void get_detection(const argo_detection::DetectionArray detections, tf::StampedT
     bbox.dimensions.y = objects.points.at(i).width;
     bbox.dimensions.z = objects.points.at(i).height;
 
-
+    if (objects.points.at(i).label_class == "VEHICLE"){
+      bbox.label = LABEL::VEHICLE; //uint32
+    }
+    else if (objects.points.at(i).label_class == "PEDESTRIAN"){
+      bbox.label = LABEL::PEDESTRIAN;
+    }
+    else{
+      bbox.label = LABEL::UNKNOWN;
+    } 
     jsk_bboxs.push_back(bbox);
-    // bbox.label = ; uint32
-
+    
 
     // get 8 corner pts in global
     std::vector<cv::Point3f> corners;
     tf::Transform g_transform = transform * pose_local;
-    // get_3d_corners(objects.points.at(i), g_transform, corners);
     get_3d_corners(bbox.dimensions, g_transform, corners);
     det_corners.push_back(corners);
   }
@@ -939,6 +996,37 @@ void get_detection(const argo_detection::DetectionArray detections, tf::StampedT
     jsk_bboxs_array.boxes.push_back(jsk_bboxs.at(i));
   }
   pub_jsk_bbox.publish(jsk_bboxs_array);
+
+
+  //pub detection hollow
+  visualization_msgs::MarkerArray det_hollow;
+  for (int i=0; i<jsk_bboxs.size(); i++){
+    visualization_msgs::Marker det;
+    pub_detection_bbox(det, jsk_bboxs.at(i), i);
+    det_hollow.markers.push_back(det);
+  }
+  pub_det_hollow.publish(det_hollow);
+
+  //
+  /*
+  visual_tools_->deleteAllMarkers();
+  for (int i=0; i<jsk_bboxs.size(); i++){    
+    Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+    Eigen::AngleAxisd q_to_axis = Eigen::AngleAxisd(Eigen::Quaterniond(jsk_bboxs.at(i).pose.orientation.w, jsk_bboxs.at(i).pose.orientation.x,\
+                                                                        jsk_bboxs.at(i).pose.orientation.y, jsk_bboxs.at(i).pose.orientation.z));
+    // wrong orientation
+    // pose.rotate(q_to_axis);
+    pose.rotate(Eigen::Quaterniond(jsk_bboxs.at(i).pose.orientation.w, jsk_bboxs.at(i).pose.orientation.x,\
+                                                                        jsk_bboxs.at(i).pose.orientation.y, jsk_bboxs.at(i).pose.orientation.z));
+    pose.translation() = Eigen::Vector3d(jsk_bboxs.at(i).pose.position.x, jsk_bboxs.at(i).pose.position.y, jsk_bboxs.at(i).pose.position.z);
+    // cout << pose.translation() << endl;
+    // cout << jsk_bboxs.at(i).pose.position.x << endl;
+    // cout << pose.rotation() << endl;                                                                                                                          
+    visual_tools_->publishWireframeCuboid(pose, jsk_bboxs.at(i).dimensions.x, jsk_bboxs.at(i).dimensions.y, jsk_bboxs.at(i).dimensions.z, rviz_visual_tools::RAND, "Wireframe Cuboid", i);
+    // visual_tools_->trigger();
+  }
+  visual_tools_->trigger();
+  */
 
   return;
 }
@@ -1195,8 +1283,8 @@ void show_id(vector<int>obj_id){
 
       marker.scale.z = 1.0f;
       marker.color.b = 0.0f;//yellow
-      marker.color.g = 0.9f;
-      marker.color.r = 0.9f;
+      marker.color.g = 1.0f;
+      marker.color.r = 1.0f;
       marker.color.a = 1;
 
       geometry_msgs::Pose pose;
@@ -1263,8 +1351,8 @@ void show_trajectory(){
       P.lifetime = ros::Duration(dt);
       P.type = visualization_msgs::Marker::POINTS;
       P.id = k+1;
-      P.scale.x = 0.3f;
-      P.scale.y = 0.3f;
+      P.scale.x = 0.2f;
+      P.scale.y = 0.2f;
       P.color.r = 1.0f;
       P.color.a = 1;
 
@@ -1779,6 +1867,36 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
   return;
 }
 
+void gt_draw_box(const visualization_msgs::MarkerArray& detection){
+  visualization_msgs::Marker marker;
+  label_array.markers.clear();
+    
+  for (int i=0; i<detection.markers.size(); i++){
+    visualization_msgs::Marker single = detection.markers.at(i);
+    // cout << single.label_class << endl;
+    marker.header.frame_id = topic;
+    marker.header.stamp = detection.markers.at(i).header.stamp;
+    marker.ns = "detection_marker";
+    marker.action = visualization_msgs::Marker::ADD;
+    marker.lifetime = ros::Duration(dt);
+    marker.type = visualization_msgs::Marker::CUBE;
+    marker.id = i;
+
+    marker.pose.position = single.pose.position;
+    marker.pose.orientation = single.pose.orientation;
+    marker.scale.x = single.scale.x;
+    marker.scale.y = single.scale.y;
+    marker.scale.z = single.scale.z;
+    marker.color.a = 0.5f;
+    marker.color.b = single.color.b;
+    marker.color.g = single.color.g; //1.0f
+    marker.color.r = single.color.r;
+
+    label_array.markers.push_back(marker);
+
+  }
+  pub_label.publish(label_array);
+}
 
 void draw_box(const argo_detection::DetectionArray& detection){
   visualization_msgs::Marker marker;
@@ -1794,7 +1912,7 @@ void draw_box(const argo_detection::DetectionArray& detection){
     marker.header.stamp = detection.header.stamp;
     marker.ns = "detection_marker";
     marker.action = visualization_msgs::Marker::ADD;
-    marker.lifetime = ros::Duration(0.5);
+    // marker.lifetime = ros::Duration(0.5);
     marker.type = visualization_msgs::Marker::CUBE;
     marker.id = i;
 
@@ -1803,7 +1921,7 @@ void draw_box(const argo_detection::DetectionArray& detection){
     marker.scale.x = single.length;
     marker.scale.y = single.width;
     marker.scale.z = single.height;
-    marker.color.a = 0.7f;
+    marker.color.a = 0.5f;
     marker.color.b = 0.0f;
     marker.color.g = 0.0f; //1.0f
     marker.color.r = 0.0f;
@@ -1958,14 +2076,14 @@ void callback(const sensor_msgs::PointCloud2ConstPtr& cloud, const argo_detectio
       obj_id.at(i) = i;
     }
     show_id(obj_id);
-    
+    draw_box(*detection);
     firstFrame=false;
     return;
   }
 
   KFT(det_timestamp, true);
   draw_box(*detection);
-                 
+
   return;
 
 }
@@ -2080,6 +2198,8 @@ int main(int argc, char** argv){
   ROS_INFO("Using %s", ((da_method_ == "g")? "greedy" : "hungarian") );
   ROS_INFO("Using iou: %s", (use_iou_ ? "true" : "false") );
 
+  visual_tools_.reset(new rviz_visual_tools::RvizVisualTools(FRAME, "/rviz_visual_markers"));
+  visual_tools_->enableBatchPublishing();
  
   
   // sub = nh.subscribe("points_raw",1000,&callback);
@@ -2091,8 +2211,10 @@ int main(int argc, char** argv){
   // sub = nh.subscribe( topic,1,&callback);
 
   // sub = nh.subscribe( "/no_ground",1,&callback);
+  // only use for train/val with ground truth
   message_filters::Subscriber<sensor_msgs::PointCloud2> sub(nh, topic, 100);
   message_filters::Subscriber<argo_detection::DetectionArray> det_sub(nh, "/detection", 100);
+  // message_filters::Subscriber<visualization_msgs::MarkerArray> gt_sub(nh, "/anno_marker", 100);
   // message_filters::Subscriber<argo_detection::DetectionArray> det_sub(nh, "/detection/lidar_objects", 500);
   
   // message_filters::TimeSynchronizer<sensor_msgs::PointCloud2, argo_detection::DetectionArray> sync(sub, det_sub, 100);
@@ -2114,8 +2236,11 @@ int main(int argc, char** argv){
   pub_pred = nh.advertise<visualization_msgs::MarkerArray>("pred_pose_marker",1);
   pub_self_v = nh.advertise<visualization_msgs::MarkerArray>("self_v_marker",1);
   pub_detection = nh.advertise<visualization_msgs::MarkerArray>("detection_marker", 1);
+  pub_label = nh.advertise<visualization_msgs::MarkerArray>("label_marker", 1);
+
   
   pub_jsk_bbox = nh.advertise<jsk_recognition_msgs::BoundingBoxArray>("jsk_output_global",1);
+  pub_det_hollow = nh.advertise<visualization_msgs::MarkerArray>("detection_hollow", 1);
 
   // tf::TransformListener listener;
   tf_listener = new tf::TransformListener();
