@@ -145,7 +145,7 @@ string FRAME="/scan";  //output frmae_id
 typedef pcl::PointXYZI PointT;
 ros::Subscriber sub,label_sub;
 ros::Publisher pub,pub_get,pub_colored;
-ros::Publisher pub_voxel,pub_marker,pub_tra,pub_pt,pub_v,pub_pred, pub_self_v, pub_detection, pub_jsk_bbox, pub_det_hollow, pub_label;
+ros::Publisher pub_voxel,pub_marker,pub_tra,pub_pt,pub_v,pub_pred, pub_self_v, pub_detection, pub_jsk_bbox, pub_det_hollow;
 ros::Publisher cluster_pub;
 
 //get.pub image
@@ -175,9 +175,10 @@ float sigmaR=0.1;//0.1
 int id_count = 0; //the counter to calculate the current occupied track_id
 
 ////////////////////////kalman/////////////////////////
-#define frame_lost 15
+#define frame_lost 10
+#define frame_stable 5
 #define detect_thres 2.5 //l=4.5,w=1.8 (4.7,1.86 for nu)
-#define bias 5.0 //5 //2.0
+#define bias 2.0 //5 //2.0
 #define moving 1 //(10hz(0.1s) v>1m/s=60m/min=3.6km/hr = pedestrian)
 #define invalid_v 30 // 108km/hr
 #define show_tra 10//6
@@ -206,18 +207,25 @@ typedef struct track{
   geometry_msgs::Point pred_v;
   int lose_frame;
   int track_frame;
-  string state;
+  int state;
   int cluster_idx;
   int uuid ;
   vector<geometry_msgs::Point> history;
   vector<float> S;
   int label;
+  int continuous_track;
 }track;
 
-enum LABEL :int{
+enum LABEL: int{
   VEHICLE = 0,
   PEDESTRIAN = 1,
   UNKNOWN = 2,  
+};
+
+enum STATE: int{
+  unstable = 0,
+  tracking = 1,
+  lost = 2,
 };
 
 
@@ -312,6 +320,8 @@ bool comparator ( const pair<double, int>& l, const pair<double, int>& r){
   return l.first < r.first; 
 }
 
+
+
 vector<int> greedy_search(const std::vector<std::vector<double>> numbers){
   int trk_num = numbers.size();
   int det_num = numbers.at(0).size();
@@ -350,15 +360,23 @@ vector<int> greedy_search(const std::vector<std::vector<double>> numbers){
 
   for(int i=0; i<trk_num*det_num; i++){
     double value = whole_value.at(i).first;
+
+    // prevent from associate to impossible det(overlaping < 0.01)
+    if (use_iou_){
+      if ( fabs(value) < 0.01 ){
+        break;
+      }
+    }
+
     // loc means index pair <trk_idx, det_idx>
-     pair<int, int> loc = whole_idx.at(whole_value.at(i).second);
+    // assignment[trk_idx] = det_idx
+    pair<int, int> loc = whole_idx.at(whole_value.at(i).second);
     if ( !(trk_matched.at(loc.first)) && !(det_matched.at(loc.second)) ){
       assignment[loc.first] = loc.second;
       trk_matched.at(loc.first) = true;
       det_matched.at(loc.second) = true;
     }
   }
-
   return assignment;
 }
 
@@ -836,14 +854,13 @@ int new_track(const jsk_recognition_msgs::BoundingBox jsk_bbox, int idx){
                                                           0,0,0,0,0,0,0,1000.0,0,0,
                                                           0,0,0,0,0,0,0,0,1000.0,0,
                                                           0,0,0,0,0,0,0,0,0,1000.0);
-
     
-
     tk.kf = ka;
-    tk.state = "tracking";
+    tk.state = STATE::unstable;
     tk.lose_frame = 0;
     // tk.track_frame = 0;
     tk.track_frame = 1;
+    tk.continuous_track = 1;
     tk.cluster_idx = idx;
 
     //
@@ -890,8 +907,6 @@ void get_bbox(){
   // this way would cause exptorplation of tf in the past
   // tf::TransformListener listener; usually keep in the whole process like:member varible of class or global 
   
-
-
   for(int i=0; i<current_m_a.markers.size(); i++){
     visualization_msgs::Marker m = current_m_a.markers.at(i);
     // if a == 0 , is clear/fake marker, having no meaning 
@@ -1206,46 +1221,6 @@ void filter_cluster(void){
         Eigen::Vector3f v3f_b = transform_inv*v3f_a;
 
         cout << "AFTER TRANS:\n" << v3f_b << endl; 
-        ///
-        
-        /*
-        /////(b) local = tf^(-1)* Tm^(-1) * global  failed
-        Eigen::Quaternionf q = Eigen::Quaternionf(or_x, or_y, or_z, or_w);
-        Eigen::Translation3f translation(x_m,y_m,z_m);
-        Eigen::Affine3f transform = translation * q.toRotationMatrix();
-        Eigen::Affine3f transform_inv = transform.inverse();
-        Eigen::Vector3f v3f_a(x,y,z);
-        Eigen::Vector3f v3f_b = transform_inv*v3f_a;
-
-        cout << "Before TRANS:\n" << v3f_b << endl; 
-
-
-
-        //v3f_b is in local origin in map frame
-        
-        geometry_msgs::PointStamped pt;
-        geometry_msgs::PointStamped pt_transformed;
-        pt.header = current_m_a.markers[0].header;
-        pt.point.x = v3f_b[0];
-        pt.point.y = v3f_b[1];
-        pt.point.z = v3f_b[2];
-
-        try{
-            tf_listener->waitForTransform("/map","/scan",ros::Time(0),ros::Duration(5.0));//blocked process till get transform or 5 sec
-            tf_listener->transformPoint("/scan", pt, pt_transformed);
-        }
-        catch(tf::TransformException &ex) {
-            ROS_WARN("%s", ex.what());
-            // ros::Duration(1.0).sleep();
-            continue;
-
-        }
-
-        v3f_b[0] = pt_transformed.point.x;
-        v3f_b[1] = pt_transformed.point.y;
-        v3f_b[2] = pt_transformed.point.z;
-        // cout << "AFTER TRANS:\n" << v3f_b << endl; 
-        */
         
     
         if ( fabs(v3f_b[0]) <= scale_x && fabs(v3f_b[1]) <= scale_y ){
@@ -1263,7 +1238,63 @@ void filter_cluster(void){
 }
 
 
-void show_id(vector<int>obj_id){
+//show tracker id
+void show_id(void){
+    visualization_msgs::Marker marker;
+    for( size_t k=0; k<filters.size(); k++){
+      
+      // Don't show false alarm
+      if (filters.at(k).track_frame <= frame_stable){
+        continue;
+      }
+
+      marker.header.frame_id = FRAME;  
+      marker.header.stamp = ros::Time();//to show every tag  (ros::Time::now()for latest tag)
+      marker.action = visualization_msgs::Marker::ADD;
+      marker.lifetime = ros::Duration(dt);
+      marker.pose.orientation.w = 1.0;
+      marker.id = k;
+      marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+
+      marker.scale.z = 1.0f;
+      marker.color.a = 1;
+      marker.color.b = 0.0f;
+      marker.color.g = 0.0f;
+      marker.color.r = 0.0f;
+
+      if (filters.at(k).state == STATE::tracking){
+        marker.color.b = 0.0f;//yellow
+        marker.color.g = 0.9f;
+        marker.color.r = 1.0f;  
+      }
+      else if (filters.at(k).state == STATE::unstable){
+        marker.color.b = 1.0f;//cyan
+        marker.color.g = 1.0f;
+        marker.color.r = 0.0f;
+      }
+      else{
+        marker.color.r = 1.0f;//red
+      }
+
+      geometry_msgs::Pose pose;
+      pose.position.x = filters.at(k).kf.statePost.at<float>(0);
+      pose.position.y = filters.at(k).kf.statePost.at<float>(1);
+      pose.position.z = filters.at(k).kf.statePost.at<float>(2) + 1.0f;
+     
+      // stringstream ss;
+      // ss << filters.at(k).uuid;
+      // marker.text = ss.str();
+
+      marker.text = to_string(filters.at(k).uuid);
+      marker.pose = pose;
+      m_s.markers.push_back(marker);
+    }
+    pub_marker.publish(m_s);
+}
+
+
+// show detection id
+void show_d_id(const vector<int>obj_id){
     int k;
     visualization_msgs::Marker marker;
     for(k=0; k<jsk_bboxs.size(); k++){
@@ -1330,32 +1361,33 @@ void show_trajectory(){
     float velocity = sqrt(pred.x*pred.x + pred.y*pred.y + pred.z*pred.z);
 
     // if (velocity >= moving && velocity < invalid_v && !(filters.at(k).state.compare("tracking"))){  
-    if (!(filters.at(k).state.compare("tracking"))){ 
+    if ( filters.at(k).state == STATE::tracking || filters.at(k).state == STATE::unstable ){ 
       visualization_msgs::Marker marker, P;
       marker.header.frame_id = FRAME;  
       marker.header.stamp = ros::Time();//to show every tag  (ros::Time::now()for latest tag)
       marker.action = visualization_msgs::Marker::ADD;
       marker.lifetime = ros::Duration(dt);
-      marker.pose.orientation.w = 1.0;
-      marker.id = k;
       marker.type = visualization_msgs::Marker::LINE_STRIP;
-
+      marker.ns = "trajectory";
+      marker.id = k;
+      marker.pose.orientation.w = 1.0;
       marker.scale.x = 0.1f;
       marker.color.g = 0.9f;
       marker.color.a = 1;
 
 
+      // history pts marker
       P.header.frame_id = FRAME;
       P.header.stamp = ros::Time();
       P.action = visualization_msgs::Marker::ADD;
       P.lifetime = ros::Duration(dt);
       P.type = visualization_msgs::Marker::POINTS;
+      P.ns = "trajectory";
       P.id = k+1;
       P.scale.x = 0.2f;
       P.scale.y = 0.2f;
       P.color.r = 1.0f;
       P.color.a = 1;
-
 
       if (filters.at(k).history.size() < show_tra){
         for (int i=0; i<filters.at(k).history.size(); i++){
@@ -1372,6 +1404,7 @@ void show_trajectory(){
         }
       }
 
+      // predicted pose (wrong, its the predicted pose for current frame, not next)
       visualization_msgs::Marker Predict_p;
       Predict_p.header.frame_id = FRAME;
       Predict_p.header.stamp = ros::Time();
@@ -1406,7 +1439,6 @@ void show_trajectory(){
 
 void show_velocity(){
   for (int k=0; k<filters.size(); k++){
-
     geometry_msgs::Point pred;
     pred.x = filters.at(k).pred_v.x;
     pred.y = filters.at(k).pred_v.y;
@@ -1414,13 +1446,14 @@ void show_velocity(){
     float velocity = sqrt(pred.x*pred.x + pred.y*pred.y + pred.z*pred.z);
 
     // if ( velocity >= moving && velocity < invalid_v && !(filters.at(k).state.compare("tracking")) ){
-    if ( !(filters.at(k).state.compare("tracking")) ){
+    if ( filters.at(k).state == STATE::tracking || filters.at(k).state == STATE::unstable ){
       visualization_msgs::Marker arrow;
       arrow.header.frame_id = FRAME;
       arrow.header.stamp = ros::Time();
-      arrow.lifetime = ros::Duration(dt);
       arrow.action = visualization_msgs::Marker::ADD;
+      arrow.lifetime = ros::Duration(dt);
       arrow.type = visualization_msgs::Marker::ARROW;
+      arrow.ns = "velocity";
       arrow.id = k;
       
       geometry_msgs::Point tail, head;
@@ -1432,32 +1465,26 @@ void show_velocity(){
       // cout << tail.x << "," << tail.y << endl;
       // cout << head.x << "," << head.y << endl;
 
-      // arrow.points.at(0) = tail;
-      // arrow.points.at(1) = head;
-
       arrow.points.push_back(tail);
       arrow.points.push_back(head);
 
-
-      // cout << arrow.points.at(0).x << endl;
-      // cout << arrow.points.at(1).x << endl;
-      arrow.color.a = 1.0f;
-      arrow.color.b = 0.7f;
       arrow.scale.x = 0.3f;
       arrow.scale.y = 0.6f;
-
+      arrow.color.b = 0.7f;
+      arrow.color.a = 1.0f;
+      
       v_array.markers.push_back(arrow);
     }
       
     //output our self calculated velocity
-    if( filters.at(k).history.size()>=2 && velocity >= moving && velocity < invalid_v && !(filters.at(k).state.compare("tracking"))){
+    if( filters.at(k).history.size()>=2 && velocity >= moving && velocity < invalid_v && (filters.at(k).state == STATE::unstable || filters.at(k).state == STATE::tracking)){
       visualization_msgs::Marker self_arrow;
-
       self_arrow.header.frame_id = FRAME;
       self_arrow.header.stamp = ros::Time();
-      self_arrow.lifetime = ros::Duration(dt);
       self_arrow.action = visualization_msgs::Marker::ADD;
+      self_arrow.lifetime = ros::Duration(dt);
       self_arrow.type = visualization_msgs::Marker::ARROW;
+      self_arrow.ns = "velocity";
       self_arrow.id = k+1;
       
       geometry_msgs::Point tail, head, v;
@@ -1472,23 +1499,18 @@ void show_velocity(){
       head.y = tail.y  + v.y;
       head.z = tail.z  + v.z;
 
-  
       self_arrow.points.push_back(tail);
       self_arrow.points.push_back(head);
 
-
-      // cout << arrow.points.at(0).x << endl;
-      // cout << arrow.points.at(1).x << endl;
-      self_arrow.color.a = 1.0f;
+      self_arrow.scale.x = 0.2f;
+      self_arrow.scale.y = 0.4f;
       self_arrow.color.r = ( 88.0f/255.0f);
       self_arrow.color.g = (183.0f/255.0f);
       self_arrow.color.b = (227.0f/255.0f);
-      self_arrow.scale.x = 0.2f;
-      self_arrow.scale.y = 0.4f;
+      self_arrow.color.a = 1.0f;
 
       self_v_array.markers.push_back(self_arrow);
     }
-
   }
 
   pub_v.publish(v_array);
@@ -1659,9 +1681,9 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
   vector<int> assignment;
   if ( da_method_ == "g"){ 
     assignment = greedy_search(distMat);
-    for(int x=0; x<distMat.size(); x++)
-      std::cout << x << "," << assignment[x] << "\t";
-    cout<<endl;
+    // for(int x=0; x<distMat.size(); x++)
+    //   std::cout << x << "," << assignment[x] << "\t";
+    // cout<<endl;
   }
   else{   
     HungarianAlgorithm HungAlgo;
@@ -1692,36 +1714,97 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
           
           obj_id.at(clus_idx) = current_track->uuid;
           current_track->cluster_idx = clus_idx;
-          current_track->state = "tracking";
-          // if (debug_){
+          current_track->track_frame += 1;
+          current_track->continuous_track += 1; 
+          current_track->lose_frame = 0;
+          // current_track->state = "tracking";
+          if (debug_){
             cout << "The track " << current_track->uuid << " dist is " << distMat[k][clus_idx] << endl;
-          // }
+          }
         }
         else{
           // if(debug_){
             cout << "FILTERED OUT！！" << " The track " << current_track->uuid << " dist is " << distMat[k][clus_idx] << endl;
           // }
-          current_track->state = "lost";
+          // current_track->state = "lost";
+          current_track->continuous_track = 0;
+          current_track->lose_frame += 1;
         }  
       }
       else{
         obj_id.at(clus_idx) = current_track->uuid;
         current_track->cluster_idx = clus_idx;
-        current_track->state = "tracking";
-        cout << "The track " << current_track->uuid << " dist is " << distMat[k][clus_idx] << endl;
+        current_track->track_frame += 1;
+        current_track->continuous_track += 1; 
+        current_track->lose_frame = 0;
+        // current_track->state = "tracking";
+        if (debug_){
+          cout << "The track " << current_track->uuid << " dist is " << distMat[k][clus_idx] << endl;
+        }
       }
     }
-    else // tracks missed(not correspondance build)
+    else // tracks missed(no correspondance built)
     {
-      current_track->state= "lost";
-      cout << "The track " << current_track->uuid << " is lost due to not matched." << endl;
+      // current_track->state= "lost";
+      current_track->continuous_track = 0;
+      current_track->lose_frame += 1;
+      if (debug_){
+        cout << "The track " << current_track->uuid << " is lost due to not matched." << endl;
+      }
     }
     
-
-    
   }  
-  ///////////////------------------------------original hungarian
 
+  // update state by track/lose_frame, continuous track, and push history pts
+  for (std::vector<track>::iterator pit = filters.begin (); pit != filters.end (); ++pit){
+    if( (*pit).continuous_track == 0 ){
+      (*pit).state = STATE::lost;
+      geometry_msgs::Point pt_his = (*pit).pred_pose;
+      (*pit).history.push_back(pt_his);
+    }
+    else{
+      if( (*pit).continuous_track >= frame_stable ){
+        (*pit).state = STATE::tracking;
+        //record the tracking trajectory
+        geometry_msgs::Point pt_his;
+        pt_his = jsk_bboxs.at((*pit).cluster_idx).pose.position;
+        (*pit).history.push_back(pt_his);
+      }
+      else{
+        (*pit).state = STATE::unstable;
+        geometry_msgs::Point pt_his;
+        pt_his = jsk_bboxs.at((*pit).cluster_idx).pose.position;
+        (*pit).history.push_back(pt_his);
+      }
+    }
+
+    if(debug_){
+        if ( (*pit).state = STATE::tracking )
+          cout<< std::setw(3) << (*pit).uuid<<" tracker is \033[1;34m"<< std::setw(8) <<"tracking"<< std::setw(11) << "\033[0m, continuous: "<< (*pit).continuous_track << ", to cluster_idx "<< (*pit).cluster_idx <<endl;
+        else if ( (*pit).state = STATE::unstable )
+          cout<< std::setw(3) << (*pit).uuid<<" tracker is \033[1;34m"<< std::setw(8) <<"unstable"<< std::setw(11) << "\033[0m, continuous: "<< (*pit).continuous_track << ", to cluster_idx "<< (*pit).cluster_idx <<endl;
+        else if ( (*pit).state = STATE::lost)
+          cout<< std::setw(3) << (*pit).uuid<<" tracker is \033[1;34m"<< std::setw(8) <<"lost"<< std::setw(11) << "\033[0m, lose: "<< (*pit).lose_frame <<endl;
+        else
+            cout<<"\033[1;31mUndefined state for tracked "<<k<<"\033[0m"<<endl;
+    }
+  }
+
+  
+  // delete lost track
+  for (std::vector<track>::iterator pit = filters.begin (); pit != filters.end ();){
+    // if we lose track consecutively ''frame_lost'' frames, remove track
+    if ( (*pit).lose_frame >= frame_lost )
+        //remove track from filters
+        pit = filters.erase(pit);
+    else
+        pit ++;
+  }
+  
+
+
+
+  /*
   // cope with existing/old track (not new_track yet), deal with lost tracks and let it remain const velocity -> update pred_pose to meas correct
   for(std::vector<track>::iterator pit = filters.begin (); pit != filters.end ();){
       if( !(*pit).state.compare("lost")  ){//true for 0
@@ -1762,6 +1845,8 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
           pit ++;
           
   }
+  */
+  
 
 
   /*
@@ -1787,49 +1872,50 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
   */
   
   ///////////////////////////////////////////////////estimate(update old/existing tracks)
+  ROS_INFO("Measurement update");
   int num = filters.size();
   float meas[num][measDim];
   i = 0;
   for(std::vector<track>::const_iterator it = filters.begin(); it != filters.end(); ++it){
-      if ( (*it).state == "tracking" ){
-          // PointT pt = cens[(*it).cluster_idx];
-          // meas[i][0] = pt.x;
-          // meas[i][1] = pt.y;
-          // meas[i][2] = pt.z;
-          jsk_recognition_msgs::BoundingBox bbox = jsk_bboxs.at((*it).cluster_idx);
-          meas[i][0] = bbox.pose.position.x;
-          meas[i][1] = bbox.pose.position.y;
-          meas[i][2] = bbox.pose.position.z;
-          meas[i][3] = bbox.dimensions.x;
-          meas[i][4] = bbox.dimensions.y;
-          meas[i][5] = bbox.dimensions.z;
-          meas[i][6] = get_yaw(bbox.pose.orientation);
-          
-      }
-      else if ( (*it).state == "lost" ){
-          // meas[i][0] = (*it).pred_pose.x; //+ (*it).pred_v.x;
-          // meas[i][1] = (*it).pred_pose.y;//+ (*it).pred_v.y;
-          // meas[i][2] = (*it).pred_pose.z; //+ (*it).pred_v.z;
-      }
-      else{
-          std::cout<<"Some tracks state not defined to tracking/lost."<<std::endl;
-      }
-      i++;
+    if ( (*it).state == STATE::tracking || (*it).state == STATE::unstable ){
+      // PointT pt = cens[(*it).cluster_idx];
+      // meas[i][0] = pt.x;
+      // meas[i][1] = pt.y;
+      // meas[i][2] = pt.z;
+      jsk_recognition_msgs::BoundingBox bbox = jsk_bboxs.at((*it).cluster_idx);
+      meas[i][0] = bbox.pose.position.x;
+      meas[i][1] = bbox.pose.position.y;
+      meas[i][2] = bbox.pose.position.z;
+      meas[i][3] = bbox.dimensions.x;
+      meas[i][4] = bbox.dimensions.y;
+      meas[i][5] = bbox.dimensions.z;
+      meas[i][6] = get_yaw(bbox.pose.orientation);
+        
+    }
+    else if ( (*it).state == STATE::lost ){
+      // do not update
+      // meas[i][0] = (*it).pred_pose.x; //+ (*it).pred_v.x;
+      // meas[i][1] = (*it).pred_pose.y;//+ (*it).pred_v.y;
+      // meas[i][2] = (*it).pred_pose.z; //+ (*it).pred_v.z;
+    }
+    else{
+      std::cout<<"Some tracks state not defined to tracking/unstable/lost."<<std::endl;
+    }
+    i++;
   }
 
-  ROS_INFO("Measurement update");
   cv::Mat measMat[num];
   for(int i=0;i<num;i++){
-      measMat[i]=cv::Mat(measDim,1,CV_32F,meas[i]);
+    measMat[i]=cv::Mat(measDim,1,CV_32F,meas[i]);
   }
 
   // The update phase 
   cv::Mat estimated[num];
   i = 0;
   for(std::vector<track>::iterator it = filters.begin(); it != filters.end(); ++it){
-      if ((*it).state == "tracking")
-        estimated[i] = (*it).kf.correct(measMat[i]); 
-      i++;
+    if ( (*it).state == STATE::tracking || (*it).state == STATE::unstable )
+      estimated[i] = (*it).kf.correct(measMat[i]); 
+    i++;
   }
 
 
@@ -1852,7 +1938,6 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
   }
 
   ROS_INFO("We now have %d tracks.", (int)filters.size());
-
   m_s.markers.resize(jsk_bboxs.size());
   m_s.markers.clear();
   tra_array.markers.clear();
@@ -1861,42 +1946,13 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
   pred_point_array.markers.clear();
   self_v_array.markers.clear();
   
-  show_id(obj_id);
+  // show_d_id(obj_id);
+  show_id();
   show_trajectory();
   show_velocity();
   return;
 }
 
-void gt_draw_box(const visualization_msgs::MarkerArray& detection){
-  visualization_msgs::Marker marker;
-  label_array.markers.clear();
-    
-  for (int i=0; i<detection.markers.size(); i++){
-    visualization_msgs::Marker single = detection.markers.at(i);
-    // cout << single.label_class << endl;
-    marker.header.frame_id = topic;
-    marker.header.stamp = detection.markers.at(i).header.stamp;
-    marker.ns = "detection_marker";
-    marker.action = visualization_msgs::Marker::ADD;
-    marker.lifetime = ros::Duration(dt);
-    marker.type = visualization_msgs::Marker::CUBE;
-    marker.id = i;
-
-    marker.pose.position = single.pose.position;
-    marker.pose.orientation = single.pose.orientation;
-    marker.scale.x = single.scale.x;
-    marker.scale.y = single.scale.y;
-    marker.scale.z = single.scale.z;
-    marker.color.a = 0.5f;
-    marker.color.b = single.color.b;
-    marker.color.g = single.color.g; //1.0f
-    marker.color.r = single.color.r;
-
-    label_array.markers.push_back(marker);
-
-  }
-  pub_label.publish(label_array);
-}
 
 void draw_box(const argo_detection::DetectionArray& detection){
   visualization_msgs::Marker marker;
@@ -2075,7 +2131,8 @@ void callback(const sensor_msgs::PointCloud2ConstPtr& cloud, const argo_detectio
     for(int i =0; i<jsk_bboxs.size(); i++){
       obj_id.at(i) = i;
     }
-    show_id(obj_id);
+    // show_d_id(obj_id);
+    show_id();
     draw_box(*detection);
     firstFrame=false;
     return;
@@ -2097,47 +2154,7 @@ void callback_label(const visualization_msgs::MarkerArray &m_a){
   return;
 }
 
-/*
-void param_parser(string out_dir){
 
-  nh.getParam("dataset", dataset);
-  nh.getParam("param", param);
-  nh.getParam("global",global);  
-  
-  if (!(dataset.compare("nuscene"))){
-    topic = "/nuscenes_lidar";
-    cout<<"On nuscene dataset, subscribe to "<< topic <<endl;
-  }
-  else if (!(dataset.compare("argo"))){
-    topic = "/scan";
-    cout<<"On argo dataset, subscribe to "<< topic <<endl;
-  }
-  else{
-    cout<<"Please provide the dataset you use as _dataset:= DATASET.\n";
-    return;
-  }
-
-
-  if( !(param.compare("output")) ){
-    string filename = "trackOutput_test.csv";
-    outputFile.open(out_dir + "/output/" + filename);
-    cout << "Output file " << filename <<endl;
-  }
-  else
-    cout << "No output" << endl;
-
-
-  if( !(global.compare("global")) ){
-    FRAME = "/map";
-  }
-  else{
-    FRAME = "/scan";
-  }
-
-  cout<<"We now at "<< FRAME << " frame." << endl;
-  return;
-}
-*/
 
 int main(int argc, char** argv){
   ros::init(argc,argv,"tracking");
@@ -2236,8 +2253,6 @@ int main(int argc, char** argv){
   pub_pred = nh.advertise<visualization_msgs::MarkerArray>("pred_pose_marker",1);
   pub_self_v = nh.advertise<visualization_msgs::MarkerArray>("self_v_marker",1);
   pub_detection = nh.advertise<visualization_msgs::MarkerArray>("detection_marker", 1);
-  pub_label = nh.advertise<visualization_msgs::MarkerArray>("label_marker", 1);
-
   
   pub_jsk_bbox = nh.advertise<jsk_recognition_msgs::BoundingBoxArray>("jsk_output_global",1);
   pub_det_hollow = nh.advertise<visualization_msgs::MarkerArray>("detection_hollow", 1);
