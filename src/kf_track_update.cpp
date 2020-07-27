@@ -145,7 +145,7 @@ string FRAME="/scan";  //output frmae_id
 typedef pcl::PointXYZI PointT;
 ros::Subscriber sub,label_sub;
 ros::Publisher pub,pub_get,pub_colored;
-ros::Publisher pub_voxel,pub_marker,pub_tra,pub_pt,pub_v,pub_pred, pub_self_v, pub_detection, pub_jsk_bbox, pub_det_hollow;
+ros::Publisher pub_voxel,pub_marker,pub_tra,pub_pt,pub_v,pub_pred, pub_self_v, pub_detection, pub_jsk_bbox, pub_det_hollow, pub_fu, pub_fu_pt;
 ros::Publisher cluster_pub;
 
 //get.pub image
@@ -178,16 +178,17 @@ int id_count = 0; //the counter to calculate the current occupied track_id
 #define frame_lost 10
 #define frame_stable 5
 #define detect_thres 2.5 //l=4.5,w=1.8 (4.7,1.86 for nu)
-#define bias 2.0 //5 //2.0
+#define bias 3.0 //5 //2.0
 #define moving 1 //(10hz(0.1s) v>1m/s=60m/min=3.6km/hr = pedestrian)
 #define invalid_v 30 // 108km/hr
 #define show_tra 10//6
 #define detection_thres 0.3f
+#define predict_frame 20
 
 bool get_label = false;
 
 // KF init
-int stateDim=10;// [x,y,z,v_x,v_y,v_z]  + w.h.l.theta
+int stateDim=10;// [x,y,z,l,w,h,yaw,v_x,v_y,v_z]
 int measDim=7;// [x,y,z,l,w,h,theta]
 int ctrlDim=0;// control input 0(acceleration=0,constant v model)
 std::vector<pcl::PointCloud<PointT>::Ptr> cluster_vec;
@@ -214,6 +215,7 @@ typedef struct track{
   vector<float> S;
   int label;
   int continuous_track;
+  vector<geometry_msgs::Point> future;
 }track;
 
 enum LABEL: int{
@@ -265,11 +267,6 @@ void pub_detection_bbox(visualization_msgs::Marker &marker, const jsk_recognitio
     pt.y = det_corners.at(idx).at(Connect_List[j+1]).y;
     pt.z = det_corners.at(idx).at(Connect_List[j+1]).z;
     marker.points.push_back(pt);
-    // geometry_msgs::Point pt;
-    // pt.x = det_corners.at(idx).at(j%4).x;
-    // pt.y = det_corners.at(idx).at(j%4).y;
-    // pt.z = det_corners.at(idx).at(j%4).z;
-    // marker.points.push_back(pt);
   }
   return;
 }
@@ -458,7 +455,9 @@ double mahalanobis_distance(track trk, jsk_recognition_msgs::BoundingBox p2){
   cv::KalmanFilter k = trk.kf;
   cv::Mat S = (k.measurementMatrix * k.errorCovPre) * k.measurementMatrix.t() + k.measurementNoiseCov;
   cv::Mat S_inv = S.inv();
-  // cout << "The tracker " << trk.uuid << ", state " << std::setw(8) << trk.state << ", S_inv: " << S_inv.at<float>(0,0) <<", lose frame: "<<trk.lose_frame<< endl;
+  if (debug_){
+    cout << "The tracker " << trk.uuid << ", state " << std::setw(8) << trk.state << ", S_inv: " << std::fixed << std::setprecision(5) << cv::determinant(S_inv) << ", lose frame: "<<trk.lose_frame<< endl;
+  }
   double m_dist = cv::Mahalanobis(tk, d, S_inv);
   return sqrt( m_dist );
 }
@@ -851,88 +850,29 @@ int new_track(const jsk_recognition_msgs::BoundingBox jsk_bbox, int idx){
                                                           0,0,0,0,1,0,0,0,0,0,
                                                           0,0,0,0,0,1,0,0,0,0,
                                                           0,0,0,0,0,0,1,0,0,0,
-                                                          0,0,0,0,0,0,0,1000.0,0,0,
-                                                          0,0,0,0,0,0,0,0,1000.0,0,
-                                                          0,0,0,0,0,0,0,0,0,1000.0);
+                                                          0,0,0,0,0,0,0,50.0,0,0,
+                                                          0,0,0,0,0,0,0,0,50.0,0,
+                                                          0,0,0,0,0,0,0,0,0,50.0);
     
     tk.kf = ka;
     tk.state = STATE::unstable;
     tk.lose_frame = 0;
-    // tk.track_frame = 0;
     tk.track_frame = 1;
     tk.continuous_track = 1;
     tk.cluster_idx = idx;
 
-    //
     geometry_msgs::Point pt_his;
     pt_his.x = jsk_bbox.pose.position.x;
     pt_his.y = jsk_bbox.pose.position.y;
     pt_his.z = jsk_bbox.pose.position.z;
     tk.history.push_back(pt_his);
 
-    // tk.uuid = ++id_count;
     tk.uuid = id_count++;
     filters.push_back(tk);
     
     return tk.uuid;
 }
 
-
-
-
-pcl::PointCloud<PointT>::Ptr crop(pcl::PointCloud<PointT>::Ptr cloud_clusters){
-  Eigen::Vector4f box_min,box_max;
-  pcl::PointCloud<PointT>::Ptr cluster_box(new pcl::PointCloud<PointT> );
-  box_min << -30,-30,-30,1;
-  box_max << 30,30,30,1;//choose 60x60x60 cube (mask)
-  pcl::CropBox<PointT> in_box;
-
-  in_box.setInputCloud(cloud_clusters);
-  in_box.setMin(box_min);
-  in_box.setMax(box_max);
-  in_box.filter(*cluster_box);
-
-  // sensor_msgs::PointCloud2 cluster_cloud;
-  // pcl::toROSMsg(*cluster_box, cluster_cloud);
-  // cluster_cloud.header.frame_id = "map";
-  // cluster_pub.publish(cluster_cloud);
-  return cluster_box;
-}
-
-
-void get_bbox(){
-  cout <<"BBOX"<<endl;
-  get_label = false;
-  
-  // this way would cause exptorplation of tf in the past
-  // tf::TransformListener listener; usually keep in the whole process like:member varible of class or global 
-  
-  for(int i=0; i<current_m_a.markers.size(); i++){
-    visualization_msgs::Marker m = current_m_a.markers.at(i);
-    // if a == 0 , is clear/fake marker, having no meaning 
-    if ( m.color.a != 0 ){
-      float x_m = m.pose.position.x;
-      float y_m = m.pose.position.y;
-      float z_m = m.pose.position.z;
-
-      double or_x = m.pose.orientation.x;
-      double or_y = m.pose.orientation.y;
-      double or_z = m.pose.orientation.z;
-      double or_w = m.pose.orientation.w;
-      float scale_x = m.scale.x/2.0f;//l
-      float scale_y = m.scale.y/2.0f;//w
-      float scale_z = m.scale.z/2.0f;//h
-
-      PointT bbox;
-      bbox.x = x_m;
-      bbox.y = y_m;
-      bbox.z = z_m;
-      cens.push_back(bbox);
-    
-    }
-
-  }
-}
 
 
 
@@ -1061,8 +1001,6 @@ void ground_remove(const sensor_msgs::PointCloud2 out){
   seg.setMaxIterations (100);
   seg.setDistanceThreshold (0.02);//0.01 for bag1
 
-  //Chose ROI to process
-  //cloud_pcl = crop(cloud_pcl_whole);
   *cloud_pcl = *cloud_pcl_whole;
 
   cout<<"Ready to segmentation."<<endl;
@@ -1289,6 +1227,7 @@ void show_id(void){
       marker.pose = pose;
       m_s.markers.push_back(marker);
     }
+    
     pub_marker.publish(m_s);
 }
 
@@ -1436,7 +1375,6 @@ void show_trajectory(){
 }
 
 
-
 void show_velocity(){
   for (int k=0; k<filters.size(); k++){
     geometry_msgs::Point pred;
@@ -1458,9 +1396,12 @@ void show_velocity(){
       
       geometry_msgs::Point tail, head;
       tail = filters.at(k).history.back();
-      head.x = tail.x  + filters.at(k).pred_v.x;
-      head.y = tail.y  + filters.at(k).pred_v.y;
-      head.z = tail.z  + filters.at(k).pred_v.z;
+      // head.x = tail.x  + filters.at(k).pred_v.x;
+      // head.y = tail.y  + filters.at(k).pred_v.y;
+      // head.z = tail.z  + filters.at(k).pred_v.z;
+      head.x = tail.x  + filters.at(k).kf.statePost.at<float>(7);
+      head.y = tail.y  + filters.at(k).kf.statePost.at<float>(8);
+      head.z = tail.z  + filters.at(k).kf.statePost.at<float>(9);
 
       // cout << tail.x << "," << tail.y << endl;
       // cout << head.x << "," << head.y << endl;
@@ -1518,6 +1459,123 @@ void show_velocity(){
 }
 
 
+void show_futurePath(void){
+  visualization_msgs::MarkerArray future_array, future_point_array;
+  for (int k=0; k<filters.size(); k++){
+    if ( filters.at(k).state == STATE::tracking || filters.at(k).state == STATE::unstable ){ 
+      visualization_msgs::Marker marker, P;
+      marker.header.frame_id = FRAME;  
+      marker.header.stamp = ros::Time();//to show every tag  (ros::Time::now()for latest tag)
+      marker.action = visualization_msgs::Marker::ADD;
+      marker.lifetime = ros::Duration(dt);
+      marker.type = visualization_msgs::Marker::LINE_STRIP;
+      marker.ns = "future path";
+      marker.id = k;
+      marker.pose.orientation.w = 1.0;
+      marker.scale.x = 0.1f;
+      marker.color.r = 1.0f;
+      marker.color.b = 1.0f;
+      marker.color.a = 1;
+
+
+      // history pts marker
+      P.header.frame_id = FRAME;
+      P.header.stamp = ros::Time();
+      P.action = visualization_msgs::Marker::ADD;
+      P.lifetime = ros::Duration(dt);
+      P.type = visualization_msgs::Marker::POINTS;
+      P.ns = "future path";
+      P.id = k+1;
+      P.scale.x = 0.2f;
+      P.scale.y = 0.2f;
+      P.color.g = 0.9f;
+      P.color.b = 0.9f;
+      P.color.a = 1;
+
+      if (filters.at(k).future.size() < show_tra){
+        for (int i=0; i<filters.at(k).future.size(); i++){
+            geometry_msgs::Point pt = filters.at(k).future.at(i);
+            marker.points.push_back(pt);
+            P.points.push_back(pt);
+        }
+      }
+      else{
+        for (vector<geometry_msgs::Point>::const_reverse_iterator r_iter = filters.at(k).future.rbegin(); r_iter != filters.at(k).future.rbegin() + show_tra; ++r_iter){
+            geometry_msgs::Point pt = *r_iter;
+            marker.points.push_back(pt);
+            P.points.push_back(pt);
+        }
+      }
+    
+      future_array.markers.push_back(marker);
+      future_point_array.markers.push_back(P);
+    }  
+  }
+  pub_fu.publish(future_array);
+  // pub_fu_pt.publish(future_point_array);
+
+}
+
+void updateKF(){
+  ROS_INFO("Measurement update");
+  int num = filters.size();
+  float meas[num][measDim];
+  int i = 0;
+  for(std::vector<track>::const_iterator it = filters.begin(); it != filters.end(); ++it){
+    if ( (*it).state == STATE::tracking || (*it).state == STATE::unstable ){
+      // PointT pt = cens[(*it).cluster_idx];
+      // meas[i][0] = pt.x;
+      // meas[i][1] = pt.y;
+      // meas[i][2] = pt.z;
+      jsk_recognition_msgs::BoundingBox bbox = jsk_bboxs.at((*it).cluster_idx);
+      meas[i][0] = bbox.pose.position.x;
+      meas[i][1] = bbox.pose.position.y;
+      meas[i][2] = bbox.pose.position.z;
+      meas[i][3] = bbox.dimensions.x;
+      meas[i][4] = bbox.dimensions.y;
+      meas[i][5] = bbox.dimensions.z;
+      meas[i][6] = get_yaw(bbox.pose.orientation);        
+    }
+    else if ( (*it).state == STATE::lost ){
+      // do not update
+      // meas[i][0] = (*it).pred_pose.x; //+ (*it).pred_v.x;
+      // meas[i][1] = (*it).pred_pose.y;//+ (*it).pred_v.y;
+      // meas[i][2] = (*it).pred_pose.z; //+ (*it).pred_v.z;
+      // using prediction to next predict, otherwise the stataPost and errorCovPost wouldn't change due to no update and gets the same prediction every time
+      // adding this would go crazy of predict
+      // (*it).kf.statePost = (*it).kf.statePre;
+      // (*it).kf.errorCovPost = (*it).kf.errorCovPre;
+    }
+    else{
+      ROS_WARN("Some tracks state not defined to tracking/unstable/lost.");
+    }
+    i++;
+  }
+
+  cv::Mat measMat[num];
+  for(int i=0;i<num;i++){
+    measMat[i]=cv::Mat(measDim,1,CV_32F,meas[i]);
+  }
+
+  // The update phase 
+  cv::Mat estimated[num];
+  i = 0;
+  for(std::vector<track>::iterator it = filters.begin(); it != filters.end(); ++it){
+    if ( (*it).state == STATE::tracking || (*it).state == STATE::unstable )
+      estimated[i] = (*it).kf.correct(measMat[i]); 
+    i++;
+  }
+
+  if(debug_){
+    for(int i=0; i<filters.size(); i++){
+      cv::KalmanFilter k = filters.at(i).kf;
+      cout << "The tracker " << filters.at(i).uuid << ", state " << std::setw(8) << filters.at(i).state << ", P_post: " << cv::determinant(k.errorCovPost) <<", lose frame: "<<filters.at(i).lose_frame<< endl;
+    }
+  }
+  return;
+}
+
+
 void KFT(ros::Time det_timestamp, bool use_mahalanobis)
 {
   for(int i=0 ;i<filters.size() ;i++){
@@ -1536,7 +1594,6 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
   }
 
   std::vector<geometry_msgs::Point> clusterCenters;
-  
   int i=0;
   for(i; i<jsk_bboxs.size(); i++){
     geometry_msgs::Point pt;
@@ -1549,12 +1606,10 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
   //construct dist matrix (mxn): m tracks, n clusters.
   std::vector<std::vector<double> > distMat; //float
 
-  for(std::vector<track>::const_iterator it = filters.begin (); it != filters.end (); ++it)
-  {
+  for(std::vector<track>::const_iterator it = filters.begin (); it != filters.end (); ++it){
       std::vector<double> distVec; //float
       if (!use_mahalanobis){
-        for(int n=0;n<jsk_bboxs.size();n++)
-        {
+        for(int n=0;n<jsk_bboxs.size();n++){
           distVec.push_back(euclidean_distance((*it).pred_pose,clusterCenters[n]));
         }
       }
@@ -1564,18 +1619,10 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
           for(int n=0; n<jsk_bboxs.size(); n++){
             distVec.push_back( (-1)*iou_distance((*it), det_corners.at(n)) );
           }
-
         }
         // using maha
         else{
-          cv::KalmanFilter k = (*it).kf;
-          cv::Mat S = (k.measurementMatrix * k.errorCovPre) * k.measurementMatrix.t() + k.measurementNoiseCov;
-          cv::Mat S_inv = S.inv();
-          if( debug_ ){
-            cout << "The tracker " << std::setw(3) << (*it).uuid << ", state " << std::setw(8) << (*it).state << ", S_inv: " << std::fixed << std::setprecision(5) << S_inv.at<float>(0,0) <<", lose frame: "<<(*it).lose_frame<< endl;
-          }
-          for(int n=0;n<jsk_bboxs.size();n++)
-          {
+          for(int n=0;n<jsk_bboxs.size();n++){
             // distVec.push_back( mahalanobis_distance( (*it), clusterCenters[n] ));
             distVec.push_back( mahalanobis_distance( (*it), jsk_bboxs.at(n) ));
           } 
@@ -1585,99 +1632,8 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
       distMat.push_back(distVec);
   }
 
-  
-  //-----------------modified hun, find the nearest cluster first, then optimize by Hungarian
-
-  // std::vector<int> cens_matched(cens.size(),-1); 
-  // std::vector<int> track_matched_id(filters.size(), -1);
-  // std::vector<int> track_matched_idx, cens_matched_idx;
-  // int k=0, matched=0;
-  // int cluster_idx = -1;
-  // std::pair<int,int> minIndex;
-  // //every track to find the min value
-
-  // for(k=0; k<filters.size(); k++){
-  //   track *current_track = &(filters.at(k));
-  //   std::vector<double> dist_vec = distMat.at(k);
-  //   std::vector<double> matched_distVec;
-
-  //   cluster_idx = find_matching(dist_vec, cens_matched);
-
-  //   if (cluster_idx != -1){
-  //     if( fabs(cens.at(cluster_idx).x - current_track->history.back().x) < fabs(current_track->pred_v.x) * dt + bias && \
-  //         fabs(cens.at(cluster_idx).y - current_track->history.back().y) < fabs(current_track->pred_v.y) * dt + bias ){//bias as gating function to filter the impossible matched detection 
-        
-  //         cens_matched[cluster_idx] = 1;
-  //         track_matched_id[k] = cluster_idx;
-  //         matched++;
-  //         track_matched_idx.push_back(k);
-  //         cens_matched_idx.push_back(cluster_idx);
-  //         current_track->state = "tracking";
-  //         std::cout<<"track "<< current_track->uuid << " tracking. track: "<<k<<" ,clus: "<<cluster_idx << std::endl;
-  //         std::cout<<"The distance is "<< distMat.at(k).at(cluster_idx) << std::endl;
-  //       }
-  //     else{
-  //       std::cout<<"track "<< current_track->uuid << " losting, not qualified.\n";
-  //       std::cout<<"The distance is "<< distMat.at(k).at(cluster_idx) << std::endl;
-  //       current_track->state = "lost";
-  //     }
-  //   }
-  //   else{
-  //     std::cout<<"track "<< current_track->uuid << " losting, already matched.\n";
-  //     current_track->state = "lost";
-  //   }
-  // }
-
-  // for (int i=0; i<track_matched_idx.size(); i++)
-  //     cout<< track_matched_idx.at(i) <<", ";
-  // cout<<endl;
-  // for (int ii=0; ii<cens_matched_idx.size(); ii++)
-  //     cout<< cens_matched_idx.at(ii) <<", ";
-  // cout<<endl;
-
-  // // initiate matched_dist_matrix to Hungarian, get optimal global assignment
-  // std::vector<std::vector<double> > matched_distMat;
-  // for(k=0; k<track_matched_idx.size(); k++){
-  //   std::vector<double> matched_distVec;
-  //   for(int jj=0; jj<cens_matched_idx.size(); jj++){
-      
-  //     matched_distVec.push_back( euclidean_distance( filters.at(track_matched_idx.at(k)).pred_pose, clusterCenters.at(cens_matched_idx.at(jj)) ) );
-    
-  //   }
-  //   matched_distMat.push_back(matched_distVec);
-  // }
 
 
-  // // for (int i=0; i<matched_distMat.size(); i++){
-  // //   vector<double> dist = matched_distMat.at(i);
-  // //   for(int j=0; j<matched_distMat.at(0).size(); j++){
-  // //     cout<<dist.at(j)<<", ";
-  // //   }
-  // //   cout<<endl;
-  // // }
-  
-  // // do Hungarian
-  // HungarianAlgorithm HungAlgo;
-  // vector<int> assignment;
-  // std::vector<int> obj_id(cens.size(),-1); 
-
-  // double cost = HungAlgo.Solve(matched_distMat, assignment);
-
-  // for (unsigned int x = 0; x < matched_distMat.size(); x++)
-  //   std::cout << x << "," << assignment[x] << "\t";
-
-  // std::cout << "\ncost: " << cost << std::endl;
-
-  // for (k=0; k<track_matched_idx.size(); k++){
-  //   int clus_idx = assignment.at(k);
-  //   int track_idx = track_matched_idx.at(k);
-  //   filters.at(track_idx).cluster_idx = cens_matched_idx.at(clus_idx);
-  //   obj_id[cens_matched_idx.at(clus_idx)] = filters.at(track_idx).uuid;
-  // }
-
-  
-  
-  //-----------------
   vector<int> assignment;
   if ( da_method_ == "g"){ 
     assignment = greedy_search(distMat);
@@ -1688,7 +1644,6 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
   else{   
     HungarianAlgorithm HungAlgo;
     double cost = HungAlgo.Solve(distMat, assignment);
-
     // for (unsigned int x = 0; x < distMat.size(); x++)
     //   std::cout << x << "," << assignment[x] << "\t";
     // std::cout << "\ncost: " << cost << std::endl;
@@ -1724,7 +1679,11 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
         }
         else{
           // if(debug_){
-            cout << "FILTERED OUT！！" << " The track " << current_track->uuid << " dist is " << distMat[k][clus_idx] << endl;
+            cout << "FILTERED OUT！！" << " The track " << current_track->uuid << " dist is " << distMat[k][clus_idx] <<", diff_x= " <<\
+            jsk_bboxs.at(clus_idx).pose.position.x - current_track->history.back().x <<", diff_y=" << \
+            jsk_bboxs.at(clus_idx).pose.position.y - current_track->history.back().y <<". vx= " << \
+            fabs(current_track->pred_v.x) << ", vy= "<< \
+            fabs(current_track->pred_v.y) << endl;
           // }
           // current_track->state = "lost";
           current_track->continuous_track = 0;
@@ -1846,8 +1805,6 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
           
   }
   */
-  
-
 
   /*
   for (int j=0; j<filters.size(); j++){
@@ -1872,52 +1829,7 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
   */
   
   ///////////////////////////////////////////////////estimate(update old/existing tracks)
-  ROS_INFO("Measurement update");
-  int num = filters.size();
-  float meas[num][measDim];
-  i = 0;
-  for(std::vector<track>::const_iterator it = filters.begin(); it != filters.end(); ++it){
-    if ( (*it).state == STATE::tracking || (*it).state == STATE::unstable ){
-      // PointT pt = cens[(*it).cluster_idx];
-      // meas[i][0] = pt.x;
-      // meas[i][1] = pt.y;
-      // meas[i][2] = pt.z;
-      jsk_recognition_msgs::BoundingBox bbox = jsk_bboxs.at((*it).cluster_idx);
-      meas[i][0] = bbox.pose.position.x;
-      meas[i][1] = bbox.pose.position.y;
-      meas[i][2] = bbox.pose.position.z;
-      meas[i][3] = bbox.dimensions.x;
-      meas[i][4] = bbox.dimensions.y;
-      meas[i][5] = bbox.dimensions.z;
-      meas[i][6] = get_yaw(bbox.pose.orientation);
-        
-    }
-    else if ( (*it).state == STATE::lost ){
-      // do not update
-      // meas[i][0] = (*it).pred_pose.x; //+ (*it).pred_v.x;
-      // meas[i][1] = (*it).pred_pose.y;//+ (*it).pred_v.y;
-      // meas[i][2] = (*it).pred_pose.z; //+ (*it).pred_v.z;
-    }
-    else{
-      std::cout<<"Some tracks state not defined to tracking/unstable/lost."<<std::endl;
-    }
-    i++;
-  }
-
-  cv::Mat measMat[num];
-  for(int i=0;i<num;i++){
-    measMat[i]=cv::Mat(measDim,1,CV_32F,meas[i]);
-  }
-
-  // The update phase 
-  cv::Mat estimated[num];
-  i = 0;
-  for(std::vector<track>::iterator it = filters.begin(); it != filters.end(); ++it){
-    if ( (*it).state == STATE::tracking || (*it).state == STATE::unstable )
-      estimated[i] = (*it).kf.correct(measMat[i]); 
-    i++;
-  }
-
+  updateKF();
 
   //initiate new tracks for unmatched cluster obj.at(cluster_idx) == -1
   for (i=0; i<jsk_bboxs.size(); i++){
@@ -1929,7 +1841,7 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
 
 
   // obj_id now is the traking result of all cens, done associate. if remain -1 => false positive(alarm)
-  //////output result
+  //output result
   if( output_ ){
     for (int i=0; i<obj_id.size(); i++){
       outputFile << det_timestamp << "," << obj_id.at(i) << "," << cens.at(i).x << "," << cens.at(i).y << "," << cens.at(i).z << endl; 
@@ -1954,6 +1866,44 @@ void KFT(ros::Time det_timestamp, bool use_mahalanobis)
 }
 
 
+void PredictFuturePath(){
+  for(int i=0; i<filters.size(); i++){
+    cv::KalmanFilter k = filters.at(i).kf;
+    vector<geometry_msgs::Point> future_list;
+    for (int j=0; j<predict_frame; j++){
+      geometry_msgs::Point pt;
+      cv::Mat pred;
+      pred = k.predict();
+      pt.x = pred.at<float>(0);
+      pt.y = pred.at<float>(1);
+      pt.z = pred.at<float>(2);
+      future_list.push_back(pt);
+
+      k.statePost = k.statePre;
+      k.errorCovPost = k.errorCovPre;
+    }
+    filters.at(i).future.swap(future_list);
+    /*
+    if (filters.at(i).uuid == 0){
+      vector<geometry_msgs::Point> f_l = filters.at(i).future;
+      geometry_msgs::Point head, tail, v;
+      head = *(f_l.begin());
+      tail = f_l.back();
+      v = filters.at(i).pred_v;
+      double dist = euclidean_distance(head, tail);
+      double vel = sqrt( v.x*v.x + v.y*v.y + v.z*v.z );
+      cout << filters.at(i).uuid << " dist: "<< dist <<", vel: " << vel << endl ;
+      // for (int k=0; k<10; k++){
+      //   cout << f_l.at(k).x << ", " << f_l.at(k).y <<", "<<f_l.at(k).z<< endl;
+      // }
+    }
+    */
+  }
+  show_futurePath();
+  return;
+}
+
+
 void draw_box(const argo_detection::DetectionArray& detection){
   visualization_msgs::Marker marker;
   detection_array.markers.clear();
@@ -1966,7 +1916,7 @@ void draw_box(const argo_detection::DetectionArray& detection){
     // cout << single.label_class << endl;
     marker.header.frame_id = topic;
     marker.header.stamp = detection.header.stamp;
-    marker.ns = "detection_marker";
+    marker.ns = "detection marker";
     marker.action = visualization_msgs::Marker::ADD;
     // marker.lifetime = ros::Duration(0.5);
     marker.type = visualization_msgs::Marker::CUBE;
@@ -2139,6 +2089,7 @@ void callback(const sensor_msgs::PointCloud2ConstPtr& cloud, const argo_detectio
   }
 
   KFT(det_timestamp, true);
+  PredictFuturePath();
   draw_box(*detection);
 
   return;
@@ -2215,8 +2166,9 @@ int main(int argc, char** argv){
   ROS_INFO("Using %s", ((da_method_ == "g")? "greedy" : "hungarian") );
   ROS_INFO("Using iou: %s", (use_iou_ ? "true" : "false") );
 
-  visual_tools_.reset(new rviz_visual_tools::RvizVisualTools(FRAME, "/rviz_visual_markers"));
-  visual_tools_->enableBatchPublishing();
+  // using rviz_visual_tool to show hollow detection, but line in unclear
+  // visual_tools_.reset(new rviz_visual_tools::RvizVisualTools(FRAME, "/rviz_visual_markers"));
+  // visual_tools_->enableBatchPublishing();
  
   
   // sub = nh.subscribe("points_raw",1000,&callback);
@@ -2224,15 +2176,11 @@ int main(int argc, char** argv){
   // label_sub = nh.subscribe("lidar_label",1,&callback_label);
   // sub = nh.subscribe("/scan",1,&callback);
   // label_sub = nh.subscribe("/anno_marker",1,&callback_label);
-
   // sub = nh.subscribe( topic,1,&callback);
-
   // sub = nh.subscribe( "/no_ground",1,&callback);
-  // only use for train/val with ground truth
+  
   message_filters::Subscriber<sensor_msgs::PointCloud2> sub(nh, topic, 100);
   message_filters::Subscriber<argo_detection::DetectionArray> det_sub(nh, "/detection", 100);
-  // message_filters::Subscriber<visualization_msgs::MarkerArray> gt_sub(nh, "/anno_marker", 100);
-  // message_filters::Subscriber<argo_detection::DetectionArray> det_sub(nh, "/detection/lidar_objects", 500);
   
   // message_filters::TimeSynchronizer<sensor_msgs::PointCloud2, argo_detection::DetectionArray> sync(sub, det_sub, 100);
   // sync.registerCallback(boost::bind(&callback, _1, _2));
@@ -2256,8 +2204,9 @@ int main(int argc, char** argv){
   
   pub_jsk_bbox = nh.advertise<jsk_recognition_msgs::BoundingBoxArray>("jsk_output_global",1);
   pub_det_hollow = nh.advertise<visualization_msgs::MarkerArray>("detection_hollow", 1);
+  pub_fu = nh.advertise<visualization_msgs::MarkerArray>("future_marker",1);
+  pub_fu_pt = nh.advertise<visualization_msgs::MarkerArray>("future_pt_marker",1);
 
-  // tf::TransformListener listener;
   tf_listener = new tf::TransformListener();
 
 
